@@ -9,12 +9,15 @@ A beautiful retro-styled search engine frontend built with React + Vite that con
 - 🔍 **Dual Search Modes** - Search web content or ARNS domains
 - 📱 **Responsive Design** - Works perfectly on desktop and mobile
 - 🌟 **Smooth Animations** - Retro-style loading animations and hover effects
+- 🎯 **Section Selector** - Choose between Web, Images, Videos, and Audios (Web active)
+- 🔄 **Random Retrieval** - Type a single letter for instant random search results
+- 📊 **Status Page** - Monitor backend health and indexing statistics
 
 ## Tech Stack
 
-- **Frontend**: React 18 + Vite
+- **Frontend**: React 19 + Vite 7
 - **Styling**: CSS with retro grid animations
-- **Backend**: FastAPI (Python)
+- **Backend**: FastAPI (Python) - deployed at arfetch.adityaberry.me
 - **Search**: CLIP embeddings + FAISS indexing
 - **Data**: Arweave blockchain content
 
@@ -52,14 +55,18 @@ glimpse/
 │   ├── components/
 │   │   ├── SearchBox.jsx      # Search input and type selection
 │   │   ├── SearchResults.jsx  # Results display grid
-│   │   └── LoadingGrid.jsx    # Animated loading component
+│   │   ├── LoadingGrid.jsx    # Animated loading component
+│   │   └── ToggleSlider.css   # Retro toggle slider styles
+│   ├── pages/
+│   │   └── Status.jsx         # Status page component
 │   ├── App.jsx               # Main app component
 │   ├── main.jsx              # React entry point
 │   └── index.css             # Global retro styling
-├── app.py                    # FastAPI backend
-├── package.json              # Frontend dependencies
-├── vite.config.js           # Vite configuration
-└── index.html               # HTML template
+├── public/                   # Static assets
+├── index.html               # Vite HTML template
+├── vite.config.js           # Vite configuration with API proxy
+├── package.json             # Frontend dependencies
+└── README.md               # This file
 ```
 
 ### Available Scripts
@@ -75,11 +82,17 @@ The frontend connects to these backend endpoints:
 
 - `GET /api/searchweb?query={query}&top_k={k}` - Search web content
 - `GET /api/searcharns?query={query}&top_k={k}` - Search ARNS domains
+- `GET /api/status` - Get backend health and statistics
 
-## Styling
+## Features
 
-The app features a retro aesthetic with:
+### Search Interface
+- **Section Selector**: Choose between Web, Images, Videos, and Audios
+- **Toggle Slider**: Switch between "All" and "ARNS" search modes
+- **Random Retrieval**: Type a single letter for instant search results
+- **Clickable Results**: Click any result card to open the URL in a new tab
 
+### Retro Design
 - **Color Scheme**: Green terminal colors (#00ff41, #003b00)
 - **Typography**: Orbitron (headings) + Share Tech Mono (body)
 - **Animations**: Grid movement, glow effects, loading pulses
@@ -94,7 +107,7 @@ npm run build
 
 2. The built files will be in the `dist/` directory
 
-3. The FastAPI backend will serve the static files automatically
+3. Deploy the `dist/` folder to any static hosting service
 
 ## Customization
 
@@ -103,7 +116,7 @@ Edit the CSS variables in `src/index.css`:
 ```css
 :root {
   --primary-color: #00ff41;
-  --secondary-color: #003b00;
+  --secondary-color: #23272e;
   --accent-color: #ff6b35;
   /* ... */
 }
@@ -114,7 +127,7 @@ Modify the grid animation in `src/index.css`:
 ```css
 @keyframes gridMove {
   0% { transform: translate(0, 0); }
-  100% { transform: translate(50px, 50px); }
+  100% { transform: translate(48px, 48px); }
 }
 ```
 
@@ -127,4 +140,4 @@ Modify the grid animation in `src/index.css`:
 
 ## License
 
-MIT License 
+MIT License
