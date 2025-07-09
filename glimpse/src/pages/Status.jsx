@@ -10,7 +10,7 @@ function Status() {
       setLoading(true)
       setError(null)
       try {
-        const res = await fetch('/api/status')
+        const res = await fetch('https://arfetch.adityaberry.me/status')
         if (!res.ok) throw new Error('Failed to fetch status')
         const data = await res.json()
         setStatus(data)

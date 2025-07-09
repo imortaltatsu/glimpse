@@ -34,8 +34,8 @@ function App() {
     setIsLoading(true)
     setSearchResults([])
     try {
-      const endpoint = searchType === 'web' ? '/api/searchweb' : '/api/searcharns'
-      const response = await fetch(`${endpoint}?query=${encodeURIComponent(query)}&top_k=10`)
+      const endpoint = searchType === 'web' ? 'searchweb' : 'searcharns'
+      const response = await fetch(`https://arfetch.adityaberry.me/${endpoint}?query=${encodeURIComponent(query)}&top_k=10`)
       if (!response.ok) {
         throw new Error('Search failed')
       }
