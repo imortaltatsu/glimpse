@@ -1,4 +1,4 @@
-# Complete Multimodal Arweave Indexer using ImageBind + ChromaDB
+# Complete Multimodal Arweave Indexer using ImageBind + cuML + ChromaDB
 
 import os
 import io
@@ -22,8 +22,7 @@ from imagebind import data
 from imagebind.models import imagebind_model
 from imagebind.models.imagebind_model import ModalityType
 from imagebind.data import load_and_transform_audio_data
-import chromadb
-from chromadb.config import Settings
+from cuml.neighbors import NearestNeighbors
 import mimetypes
 import logging
 import tempfile
@@ -33,8 +32,8 @@ import librosa
 import subprocess
 import uuid
 import re
-from urllib.parse import urlparse, urljoin
-from urllib.robotparser import RobotFileParser
+import chromadb
+from chromadb.config import Settings
 
 print("✅ All imports completed successfully")
 
@@ -57,13 +56,20 @@ DATA_DIR = "index_data"
 os.makedirs(DATA_DIR, exist_ok=True)
 MODALITIES = ["web", "image", "audio", "video", "all"]
 
-# ChromaDB Configuration
-CHROMA_PERSIST_DIR = os.path.join(DATA_DIR, "chroma_db")
-os.makedirs(CHROMA_PERSIST_DIR, exist_ok=True)
+INDEX_FILES = {m: os.path.join(DATA_DIR, f"{m}_index.npy") for m in MODALITIES}
+META_FILES = {m: os.path.join(DATA_DIR, f"{m}_meta.json") for m in MODALITIES}
+CURSOR_FILE = os.path.join(DATA_DIR, "last_cursor.txt")
+BATCH_SIZE = 100
+TOP_K = 10
+POLL_INTERVAL = 60
+
+# ==== ChromaDB Configuration ====
+CHROMA_DB_PATH = os.path.join(DATA_DIR, "chroma_db")
+os.makedirs(CHROMA_DB_PATH, exist_ok=True)
 
 # Initialize ChromaDB client
 chroma_client = chromadb.PersistentClient(
-    path=CHROMA_PERSIST_DIR,
+    path=CHROMA_DB_PATH,
     settings=Settings(
         anonymized_telemetry=False,
         allow_reset=True
@@ -76,39 +82,29 @@ for modality in MODALITIES:
     try:
         collections[modality] = chroma_client.get_or_create_collection(
             name=f"arweave_{modality}",
-            metadata={"description": f"Arweave {modality} content embeddings"}
+            metadata={"description": f"Arweave {modality} embeddings"}
         )
-        logger.info(f"✅ ChromaDB collection 'arweave_{modality}' initialized")
+        logger.info(f"✅ ChromaDB collection 'arweave_{modality}' ready")
     except Exception as e:
-        logger.error(f"Failed to initialize ChromaDB collection for {modality}: {e}")
+        logger.error(f"Failed to create ChromaDB collection for {modality}: {e}")
+        collections[modality] = None
 
-# ARNS-specific collection
+# Create ARNS-specific collection
 try:
-    arns_collection = chroma_client.get_or_create_collection(
+    collections["arns"] = chroma_client.get_or_create_collection(
         name="arweave_arns",
-        metadata={"description": "Arweave ARNS content embeddings"}
+        metadata={"description": "Arweave ARNS embeddings"}
     )
-    logger.info("✅ ChromaDB ARNS collection initialized")
+    logger.info("✅ ChromaDB collection 'arweave_arns' ready")
 except Exception as e:
-    logger.error(f"Failed to initialize ChromaDB ARNS collection: {e}")
+    logger.error(f"Failed to create ARNS ChromaDB collection: {e}")
+    collections["arns"] = None
 
-BATCH_SIZE = 100
-TOP_K = 10
-POLL_INTERVAL = 60
-
-# ==== Load ImageBind with CPU Fallback ====
+# ==== Load ImageBind ====
 print("🔄 Loading ImageBind model...")
-try:
-    model = imagebind_model.imagebind_huge(pretrained=True)
-    model.eval().to(DEVICE)
-    print(f"✅ ImageBind model loaded successfully on {DEVICE}")
-except Exception as e:
-    print(f"⚠️  Failed to load ImageBind on {DEVICE}, falling back to CPU")
-    DEVICE = "cpu"
-    model = imagebind_model.imagebind_huge(pretrained=True)
-    model.eval().to(DEVICE)
-    print("✅ ImageBind model loaded successfully on CPU")
-
+model = imagebind_model.imagebind_huge(pretrained=True)
+model.eval().to(DEVICE)
+print(f"✅ ImageBind model loaded successfully on {DEVICE}")
 splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=100)
 print("✅ Text splitter initialized")
 
@@ -157,6 +153,74 @@ def load_cursor(modality):
     path = os.path.join(DATA_DIR, f"{modality}_cursor.txt")
     return open(path).read().strip() if os.path.exists(path) else None
 
+# ==== ChromaDB Storage Functions ====
+def store_in_chromadb(embedding, metadata, modality):
+    """Store embedding and metadata in ChromaDB collection."""
+    try:
+        if modality not in collections or collections[modality] is None:
+            logger.error(f"ChromaDB collection for {modality} not available")
+            return False
+        
+        # Generate unique ID for the document
+        doc_id = f"{modality}_{metadata.get('txid', str(uuid.uuid4()))}"
+        
+        # Add embedding to collection
+        collections[modality].add(
+            embeddings=[embedding.tolist()],
+            documents=[metadata.get('chunk', '')],
+            metadatas=[metadata],
+            ids=[doc_id]
+        )
+        
+        logger.info(f"✅ Stored embedding in ChromaDB for {modality}: {doc_id}")
+        return True
+        
+    except Exception as e:
+        logger.error(f"Failed to store in ChromaDB for {modality}: {e}")
+        return False
+
+def search_in_chromadb(query_embedding, modality, top_k=10):
+    """Search for similar embeddings in ChromaDB collection."""
+    try:
+        if modality not in collections or collections[modality] is None:
+            logger.error(f"ChromaDB collection for {modality} not available")
+            return {"results": []}
+        
+        # Search in collection
+        results = collections[modality].query(
+            query_embeddings=[query_embedding.tolist()],
+            n_results=top_k
+        )
+        
+        # Format results
+        formatted_results = []
+        if results['ids'] and results['ids'][0]:
+            for i in range(len(results['ids'][0])):
+                result = {
+                    "score": results['distances'][0][i],  # Convert distance to similarity
+                    "id": results['ids'][0][i],
+                    "metadata": results['metadatas'][0][i],
+                    "document": results['documents'][0][i]
+                }
+                formatted_results.append(result)
+        
+        logger.info(f"✅ ChromaDB search for {modality} returned {len(formatted_results)} results")
+        return {"results": formatted_results}
+        
+    except Exception as e:
+        logger.error(f"Failed to search in ChromaDB for {modality}: {e}")
+        return {"results": []}
+
+def get_collection_count(modality):
+    """Get the number of documents in a ChromaDB collection."""
+    try:
+        if modality not in collections or collections[modality] is None:
+            return 0
+        return collections[modality].count()
+    except Exception as e:
+        logger.error(f"Failed to get count for {modality}: {e}")
+        return 0
+        
 # Example: a larger list (expand as needed)
 ARWEAVE_DOMAINS = [
     "arweave.net", "arnode.asia", "ar.io", "arweave.dev", "arweave.live", "arweave-search.goldsky.com"
@@ -164,91 +228,6 @@ ARWEAVE_DOMAINS = [
 ]
 
 from urllib.parse import urlparse, urlunparse
-
-# Robots.txt functionality
-def get_robots_txt_url(url):
-    """
-    Get the robots.txt URL for a given URL.
-    """
-    parsed = urlparse(url)
-    robots_url = f"{parsed.scheme}://{parsed.netloc}/robots.txt"
-    return robots_url
-
-def parse_robots_txt(robots_url):
-    """
-    Parse robots.txt content and return a RobotFileParser object.
-    """
-    try:
-        rp = RobotFileParser()
-        rp.set_url(robots_url)
-        rp.read()
-        return rp
-    except Exception as e:
-        logger.warning(f"Failed to parse robots.txt from {robots_url}: {e}")
-        return None
-
-def can_fetch_url(url, user_agent="ArweaveIndexer/1.0"):
-    """
-    Check if the URL can be fetched according to robots.txt.
-    Returns True if allowed, False if disallowed, None if robots.txt is unavailable.
-    """
-    try:
-        robots_url = get_robots_txt_url(url)
-        rp = parse_robots_txt(robots_url)
-        
-        if rp is None:
-            # If robots.txt is unavailable, assume allowed
-            logger.info(f"Robots.txt unavailable for {url}, assuming allowed")
-            return True
-        
-        can_fetch = rp.can_fetch(user_agent, url)
-        if can_fetch:
-            logger.info(f"Robots.txt allows fetching {url}")
-        else:
-            logger.warning(f"Robots.txt disallows fetching {url}")
-        
-        return can_fetch
-        
-    except Exception as e:
-        logger.warning(f"Error checking robots.txt for {url}: {e}")
-        # On error, assume allowed to avoid blocking legitimate content
-        return True
-
-def get_crawl_delay(url, user_agent="ArweaveIndexer/1.0"):
-    """
-    Get the crawl delay specified in robots.txt for a URL.
-    Returns the delay in seconds, or 0 if not specified.
-    """
-    try:
-        robots_url = get_robots_txt_url(url)
-        rp = parse_robots_txt(robots_url)
-        
-        if rp is None:
-            return 0
-        
-        # RobotFileParser doesn't directly expose crawl_delay, so we need to parse it manually
-        try:
-            response = requests.get(robots_url, timeout=10)
-            if response.status_code == 200:
-                content = response.text.lower()
-                lines = content.split('\n')
-                
-                for line in lines:
-                    if line.startswith('crawl-delay:'):
-                        try:
-                            delay = float(line.split(':', 1)[1].strip())
-                            logger.info(f"Crawl delay for {url}: {delay} seconds")
-                            return delay
-                        except ValueError:
-                            continue
-        except Exception as e:
-            logger.warning(f"Failed to get crawl delay from {robots_url}: {e}")
-        
-        return 0
-        
-    except Exception as e:
-        logger.warning(f"Error getting crawl delay for {url}: {e}")
-        return 0
 
 def arweave_domain_fallback_urls(url):
     parsed = urlparse(url)
@@ -298,6 +277,7 @@ def get_magic_bytes(url, num_bytes=16):
                 time.sleep(RETRY_SLEEP)
     return b""
 
+# --- Improved File Type Detection ---
 def detect_file_type(url):
     ext = os.path.splitext(url.split("?")[0])[1].lower()
     if ext == '.pdf':
@@ -391,6 +371,283 @@ def detect_file_type(url):
         return "web"
     return "binary"
 
+# --- Helper: Check if URL is a webpage ---
+def check_webpage(url):
+    try:
+        resp = requests.get(url, timeout=5)
+        text = resp.text
+        if "<!doctype html" in text.lower() or "<html" in text.lower():
+            return True
+        if any(tag in text.lower() for tag in ["<head", "<body", "<title", "<meta"]):
+            return True
+        return False
+    except Exception:
+        return False
+
+# --- Helper: Robots.txt and Crawl Delay ---
+def get_robots_txt_url(url):
+    parsed = urlparse(url)
+    return f"{parsed.scheme}://{parsed.netloc}/robots.txt"
+
+def parse_robots_txt(robots_url):
+    try:
+        from urllib.robotparser import RobotFileParser
+        rp = RobotFileParser()
+        rp.set_url(robots_url)
+        rp.read()
+        return rp
+    except Exception as e:
+        logger.warning(f"Failed to parse robots.txt from {robots_url}: {e}")
+        return None
+
+def can_fetch_url(url, user_agent="ArweaveIndexer/1.0"):
+    try:
+        robots_url = get_robots_txt_url(url)
+        rp = parse_robots_txt(robots_url)
+        if rp is None:
+            return None
+        return rp.can_fetch(user_agent, url)
+    except Exception:
+        return None
+
+def get_crawl_delay(url, user_agent="ArweaveIndexer/1.0"):
+    try:
+        robots_url = get_robots_txt_url(url)
+        rp = parse_robots_txt(robots_url)
+        if rp is None:
+            return 0
+        delay = rp.crawl_delay(user_agent)
+        return delay if delay is not None else 0
+    except Exception:
+        return 0
+
+# --- Helper: Extract main content from soup ---
+def extract_main_content(soup):
+    # Try to find <main> tag first
+    main = soup.find('main')
+    if main:
+        return main
+    # Fallback: use <body>
+    body = soup.find('body')
+    if body:
+        return body
+    # Fallback: use whole soup
+    return soup
+
+# --- Helper: Validate content ---
+def is_valid_content(text, min_length=50, max_length=100000):
+    if not text or not isinstance(text, str):
+        return False
+    text = text.strip()
+    if len(text) < min_length:
+        return False
+    if len(text) > max_length:
+        return False
+    if all(c in '\n\r\t ' for c in text):
+        return False
+    return True
+
+# --- Helper: Clean text ---
+def clean_text(text):
+    if not text:
+        return ""
+    return ' '.join(text.split())
+
+# --- Helper: Create semantic chunks from text elements ---
+def create_semantic_chunks(text_elements, max_chunk_size=1000, min_chunk_size=100):
+    chunks = []
+    current_chunk = []
+    current_length = 0
+    for elem in text_elements:
+        text = elem['text']
+        if not text:
+            continue
+        if current_length + len(text) > max_chunk_size and current_chunk:
+            chunks.append({'text': ' '.join([e['text'] for e in current_chunk]), 'elements': current_chunk})
+            current_chunk = []
+            current_length = 0
+        current_chunk.append(elem)
+        current_length += len(text)
+    if current_chunk:
+        chunks.append({'text': ' '.join([e['text'] for e in current_chunk]), 'elements': current_chunk})
+    # Filter out too-small chunks
+    return [c for c in chunks if len(c['text']) >= min_chunk_size]
+
+# --- Helper: Extract enhanced metadata from web loader ---
+def extract_enhanced_metadata_from_web_loader(web_loader_metadata, url):
+    # This can be expanded for more fields as needed
+    return {
+        'title': web_loader_metadata.get('title', ''),
+        'description': web_loader_metadata.get('description', ''),
+        'url': web_loader_metadata.get('url', url),
+        'language': web_loader_metadata.get('language', ''),
+        'source': web_loader_metadata.get('source', ''),
+        'content': web_loader_metadata.get('content', ''),
+    }
+
+# --- Helper: Create weighted chunks from web loader ---
+def create_weighted_chunks_from_web_loader(web_loader_metadata, enhanced_metadata):
+    # For now, just create a single chunk with all content
+    content = web_loader_metadata.get('content', '')
+    title = web_loader_metadata.get('title', '')
+    description = web_loader_metadata.get('description', '')
+    chunks = []
+    if title:
+        chunks.append({'text': title, 'weight': 3.0, 'type': 'title', 'section': 'Title'})
+    if description:
+        chunks.append({'text': description, 'weight': 2.0, 'type': 'description', 'section': 'Description'})
+    if content:
+        # Split content into paragraphs for chunking
+        for para in content.split('\n'):
+            para = para.strip()
+            if is_valid_content(para, min_length=50):
+                chunks.append({'text': para, 'weight': 1.0, 'type': 'content', 'section': 'Content'})
+    return chunks
+
+# --- Helper: Create weighted embeddings for chunks ---
+def create_weighted_embeddings(chunks, url, is_arns=False):
+    results = []
+    for chunk in chunks:
+        try:
+            emb = embed_text(chunk['text'])
+            meta = {
+                'txid': extract_txid_or_arns_name(url),
+                'url': url,
+                'title': chunk.get('section', chunk.get('type', '')),
+                'chunk': chunk['text'],
+                'description': '',
+                'modality': 'web',
+                'section': chunk.get('section', ''),
+                'weight': chunk.get('weight', 1.0),
+                'type': chunk.get('type', 'content'),
+            }
+            results.append((emb, meta))
+        except Exception as e:
+            logger.error(f"Failed to embed chunk for {url}: {e}")
+    return results
+
+# --- Enhanced Webpage Indexing with Metadata ---
+def enhanced_webpage_indexing_with_metadata(url, is_arns=False):
+    try:
+        if not check_webpage(url):
+            logger.info(f"Skipping {url} - not a valid webpage")
+            return []
+        can_fetch = can_fetch_url(url)
+        if can_fetch is False:
+            logger.warning(f"Skipping {url} - robots.txt disallows crawling")
+            return []
+        elif can_fetch is True:
+            crawl_delay = get_crawl_delay(url)
+            if crawl_delay > 0:
+                logger.info(f"Applying crawl delay of {crawl_delay} seconds for {url}")
+                time.sleep(crawl_delay)
+        web_loader_metadata = None
+        web_loader_content = None
+        for test_url in arweave_domain_fallback_urls(url):
+            try:
+                logger.info(f"Attempting WebBaseLoader for {test_url}")
+                loader = WebBaseLoader(test_url)
+                docs = loader.load()
+                if docs:
+                    content = "\n".join([doc.page_content for doc in docs])
+                    first_doc = docs[0]
+                    title = first_doc.metadata.get("title", "") if hasattr(first_doc, 'metadata') else ""
+                    description = first_doc.metadata.get("description", "") if hasattr(first_doc, 'metadata') else ""
+                    web_loader_metadata = {
+                        "title": title,
+                        "description": description,
+                        "content": content,
+                        "source": test_url,
+                        "language": first_doc.metadata.get("language", ""),
+                        "url": test_url
+                    }
+                    web_loader_content = content
+                    if title.strip() == "ArNS - Arweave Name System":
+                        logger.info(f"Skipping {test_url} - standard unassigned ARNS page")
+                        return []
+                    logger.info(f"✅ WebBaseLoader successful for {test_url}")
+                    break
+            except Exception as e:
+                logger.warning(f"WebBaseLoader failed for {test_url}: {e}")
+                continue
+        if not web_loader_metadata:
+            logger.info(f"WebBaseLoader failed, trying BeautifulSoup fallback for {url}")
+            can_fetch_fallback = can_fetch_url(url)
+            if can_fetch_fallback is False:
+                logger.warning(f"Skipping {url} - robots.txt disallows crawling (fallback)")
+                return []
+            elif can_fetch_fallback is True:
+                crawl_delay = get_crawl_delay(url)
+                if crawl_delay > 0:
+                    logger.info(f"Applying crawl delay of {crawl_delay} seconds for {url} (fallback)")
+                    time.sleep(crawl_delay)
+            html_content = None
+            for test_url in arweave_domain_fallback_urls(url):
+                try:
+                    resp = requests.get(test_url, timeout=30, headers={
+                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+                    })
+                    resp.raise_for_status()
+                    html_content = resp.text
+                    break
+                except Exception as e:
+                    logger.warning(f"Direct fetch failed for {test_url}: {e}")
+                    continue
+            if html_content:
+                soup = BeautifulSoup(html_content, "html.parser")
+                main_content = extract_main_content(soup)
+                content = main_content.get_text(" ", strip=True) if main_content else ""
+                title = ""
+                title_selectors = [
+                    'meta[property="og:title"]',
+                    'meta[name="twitter:title"]', 
+                    'meta[name="title"]',
+                    'title'
+                ]
+                for selector in title_selectors:
+                    tag = soup.select_one(selector)
+                    if tag:
+                        if tag.name == 'meta':
+                            title = tag.get('content', '').strip()
+                        else:
+                            title = tag.get_text(strip=True)
+                        if title and is_valid_content(title):
+                            break
+                description = ""
+                desc_selectors = [
+                    'meta[name="description"]',
+                    'meta[property="og:description"]',
+                    'meta[name="twitter:description"]'
+                ]
+                for selector in desc_selectors:
+                    tag = soup.select_one(selector)
+                    if tag and tag.get('content'):
+                        description = tag['content'].strip()
+                        if is_valid_content(description):
+                            break
+                web_loader_metadata = {
+                    "title": title,
+                    "description": description,
+                    "content": content,
+                    "source": url,
+                    "language": "",
+                    "url": url
+                }
+                web_loader_content = content
+                if title.strip() == "ArNS - Arweave Name System":
+                    logger.info(f"Skipping {url} - standard unassigned ARNS page")
+                    return []
+                logger.info(f"✅ BeautifulSoup fallback successful for {url}")
+        if web_loader_metadata and web_loader_content:
+            enhanced_metadata = extract_enhanced_metadata_from_web_loader(web_loader_metadata, url)
+            chunks = create_weighted_chunks_from_web_loader(web_loader_metadata, enhanced_metadata)
+            if chunks:
+                return create_weighted_embeddings(chunks, url, is_arns)
+        logger.warning(f"No valid content extracted from {url}")
+        return []
+    except Exception as e:
+        logger.error(f"Enhanced webpage indexing failed for {url}: {e}")
+        return []
 
 # ==== Embedding Functions ====
 def embed_text(text):
@@ -419,7 +676,7 @@ def embed_image(url):
                 emb /= emb.norm(dim=-1, keepdim=True)
             return emb[0].cpu().numpy()
         finally:
-            os.remove(temp_path)
+                os.remove(temp_path)
     except Exception as e:
         logger.error(f"[embed_image] Failed to embed image from {url}: {e}")
         return None
@@ -491,15 +748,16 @@ def embed_video(url):
                     return None
             else:
                 vision_data = data.load_and_transform_video_data([temp_path], device=DEVICE)
-            # Force tensor conversion for all cases
+            # Convert to tensor if needed
+            if isinstance(vision_data, np.ndarray):
+                vision_data = torch.from_numpy(vision_data)
             if not torch.is_tensor(vision_data):
                 try:
                     vision_data = torch.from_numpy(np.array(vision_data))
                 except Exception as e:
                     logger.error(f"[embed_video] Could not convert vision_data to tensor for {url}: {e}")
                     return None
-            logger.error(f"[embed_video] About to call model. vision_data type: {type(vision_data)}, is_tensor: {torch.is_tensor(vision_data)}, device: {getattr(vision_data, 'device', None)}")
-            if hasattr(vision_data, 'device') and vision_data.device != torch.device(DEVICE):
+            if hasattr(vision_data, 'to'):
                 vision_data = vision_data.to(DEVICE)
             inputs = {ModalityType.VISION: vision_data}
             with torch.no_grad():
@@ -572,7 +830,7 @@ def fetch_arns(name):
                     time.sleep(RETRY_SLEEP)
     raise Exception("All ARNS endpoints failed")
 
-# ==== Enhanced Content Parsing ====
+# ==== Content Parsing (update fetch_webpage_text to use redundancy) ====
 def fetch_webpage_text(url):
     if "cu.ardrive.io" in url:
         for attempt in range(RETRY_COUNT):
@@ -603,293 +861,6 @@ def fetch_webpage_text(url):
                 time.sleep(RETRY_SLEEP)
     return "", "", ""
 
-def is_valid_content(text, min_length=50, max_length=100000):
-    """Validate content quality and length."""
-    if not text or not isinstance(text, str):
-        return False
-    
-    # Check length
-    if len(text.strip()) < min_length:
-        return False
-    
-    if len(text) > max_length:
-        return False
-    
-    # Check for common low-quality indicators
-    text_lower = text.lower()
-    
-    # Skip if too much code/technical content
-    code_indicators = ['function(', 'var ', 'const ', 'let ', 'import ', 'export ', 'class ', 'public class']
-    code_count = sum(1 for indicator in code_indicators if indicator in text_lower)
-    if code_count > 3:
-        return False
-    
-    # Skip if too much HTML/XML markup
-    markup_count = text.count('<') + text.count('>')
-    if markup_count > len(text) * 0.1:  # More than 10% markup
-        return False
-    
-    # Skip if too much whitespace
-    if len(text.strip()) / len(text) < 0.7:
-        return False
-    
-    return True
-
-def extract_rich_metadata(soup, url):
-    """Extract comprehensive metadata from webpage."""
-    metadata = {}
-    
-    # Title extraction with fallbacks
-    title = ""
-    title_selectors = [
-        'meta[property="og:title"]',
-        'meta[name="twitter:title"]',
-        'meta[name="title"]',
-        'title'
-    ]
-    
-    for selector in title_selectors:
-        tag = soup.select_one(selector)
-        if tag:
-            if tag.name == 'meta':
-                title = tag.get('content', '').strip()
-            else:
-                title = tag.get_text(strip=True)
-            if title:
-                break
-    
-    metadata['title'] = title or url
-    
-    # Description extraction
-    desc_selectors = [
-        'meta[name="description"]',
-        'meta[property="og:description"]',
-        'meta[name="twitter:description"]'
-    ]
-    
-    for selector in desc_selectors:
-        tag = soup.select_one(selector)
-        if tag and tag.get('content'):
-            metadata['description'] = tag['content'].strip()
-            break
-    
-    # Author extraction
-    author_selectors = [
-        'meta[name="author"]',
-        'meta[property="article:author"]',
-        'meta[name="twitter:creator"]'
-    ]
-    
-    for selector in author_selectors:
-        tag = soup.select_one(selector)
-        if tag and tag.get('content'):
-            metadata['author'] = tag['content'].strip()
-            break
-    
-    # Keywords/tags
-    keywords_tag = soup.select_one('meta[name="keywords"]')
-    if keywords_tag and keywords_tag.get('content'):
-        metadata['keywords'] = keywords_tag['content'].strip()
-    
-    # Language detection
-    lang_tag = soup.select_one('html[lang]')
-    if lang_tag:
-        metadata['language'] = lang_tag['lang']
-    
-    return metadata
-
-def clean_text(text):
-    """Clean and normalize text content."""
-    if not text:
-        return ""
-    
-    # Remove excessive whitespace
-    text = ' '.join(text.split())
-    
-    # Remove common unwanted patterns
-    unwanted_patterns = [
-        r'\s+',  # Multiple spaces
-        r'\[.*?\]',  # Square brackets content
-        r'\(.*?\)',  # Parentheses content (optional)
-        r'http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+',  # URLs
-    ]
-    
-    for pattern in unwanted_patterns:
-        text = re.sub(pattern, ' ', text)
-    
-    # Final cleanup
-    text = ' '.join(text.split())
-    return text.strip()
-
-def parse_webpage(html):
-    """Enhanced webpage parsing with better content extraction and validation."""
-    try:
-        soup = BeautifulSoup(html, "html.parser")
-        
-        # Extract rich metadata
-        metadata = extract_rich_metadata(soup, "")
-        
-        # Remove unnecessary tags but keep some structure
-        for tag in soup([
-            "script", "style", "noscript", "header", "footer", "nav", "aside", 
-            "form", "input", "svg", "canvas", "iframe", "button", "figure", 
-            "img", "link", "meta", "object", "embed", "applet", "base", 
-            "map", "area", "track", "audio", "video", "noscript"
-        ]):
-            tag.decompose()
-        
-        # Extract content from various text elements
-        text_elements = []
-        
-        # Get all text-containing elements
-        for elem in soup.find_all(["h1", "h2", "h3", "h4", "h5", "h6", "p", "div", "span", "li", "td", "th"]):
-            text = elem.get_text(" ", strip=True)
-            if text and len(text.strip()) > 10:  # Minimum meaningful length
-                text_elements.append({
-                    'tag': elem.name,
-                    'text': clean_text(text),
-                    'level': int(elem.name[1]) if elem.name.startswith('h') else 0
-                })
-        
-        # Create semantic chunks
-        chunks = []
-        current_section = metadata.get('title', '')
-        current_level = 0
-        
-        for elem in text_elements:
-            # Update section based on heading hierarchy
-            if elem['tag'].startswith('h'):
-                if elem['level'] <= current_level + 1:  # Only go deeper or same level
-                    current_section = elem['text']
-                    current_level = elem['level']
-            elif elem['tag'] == 'p' and elem['text']:
-                # Create chunk for paragraph content
-                if is_valid_content(elem['text']):
-                    chunk = {
-                        "title": metadata.get('title', ''),
-                        "section": current_section,
-                        "text": elem['text'],
-                        "meta_desc": metadata.get('description', ''),
-                        "author": metadata.get('author', ''),
-                        "keywords": metadata.get('keywords', ''),
-                        "language": metadata.get('language', ''),
-                        "tag": elem['tag']
-                    }
-                    chunks.append(chunk)
-        
-        # If no chunks from paragraphs, try to create chunks from other content
-        if not chunks:
-            all_text = soup.get_text(" ", strip=True)
-            all_text = clean_text(all_text)
-            
-            if is_valid_content(all_text):
-                # Split into reasonable chunks
-                words = all_text.split()
-                chunk_size = 200  # words per chunk
-                
-                for i in range(0, len(words), chunk_size):
-                    chunk_text = " ".join(words[i:i + chunk_size])
-                    if is_valid_content(chunk_text):
-                        chunk = {
-                            "title": metadata.get('title', ''),
-                            "section": current_section,
-                            "text": chunk_text,
-                            "meta_desc": metadata.get('description', ''),
-                            "author": metadata.get('author', ''),
-                            "keywords": metadata.get('keywords', ''),
-                            "language": metadata.get('language', ''),
-                            "tag": "div"
-                        }
-                        chunks.append(chunk)
-        
-        logger.info(f"Parsed webpage: {len(chunks)} valid chunks, title: {metadata.get('title', '')}")
-        return chunks
-        
-    except Exception as e:
-        logger.error(f"Error parsing webpage: {e}")
-        return []
-
-def enhanced_index_file(url, is_arns=False, force_web=False):
-    """Enhanced file indexing with better web content handling."""
-    normalized_url = normalize_url(url)
-    
-    # Deduplication: skip if normalized_url already indexed
-    with indexed_txids_lock:
-        if normalized_url in indexed_txids:
-            logger.info(f"Skipping already indexed normalized URL: {normalized_url}")
-            return
-    
-    if force_web:
-        filetype = "web"
-    else:
-        filetype = detect_file_type(url)
-    
-    if filetype == "pdf":
-        logger.info(f"Skipping PDF file: {url}")
-        return
-    
-    if filetype == "image":
-        emb, modality = embed_image(url), "image"
-        if emb is not None:
-            meta = {"txid": extract_txid_or_arns_name(url), "url": url, "title": url, "chunk": "", "description": f"{modality} from {url}", "modality": modality}
-            store(emb, meta, modality)
-            logger.info(f"Indexed {modality} file: {url}")
-        else:
-            logger.error(f"Embedding failed for {modality} file: {url}")
-        return
-    elif filetype == "audio":
-        emb, modality = embed_audio(url), "audio"
-        if emb is not None:
-            meta = {"txid": extract_txid_or_arns_name(url), "url": url, "title": url, "chunk": "", "description": f"{modality} from {url}", "modality": modality}
-            store(emb, meta, modality)
-            logger.info(f"Indexed {modality} file: {url}")
-        else:
-            logger.error(f"Embedding failed for {modality} file: {url}")
-        return
-    elif filetype == "video":
-        emb, modality = embed_video(url), "video"
-        if emb is not None:
-            meta = {"txid": extract_txid_or_arns_name(url), "url": url, "title": url, "chunk": "", "description": f"{modality} from {url}", "modality": modality}
-            store(emb, meta, modality)
-            logger.info(f"Indexed {modality} file: {url}")
-        else:
-            logger.error(f"Embedding failed for {modality} file: {url}")
-        return
-    elif filetype == "web":
-        try:
-            # Use enhanced webpage indexing with comprehensive metadata
-            weighted_results = enhanced_webpage_indexing_with_metadata(url, is_arns)
-            
-            if not weighted_results:
-                logger.warning(f"No valid content extracted from {url}")
-                return
-            
-            logger.info(f"Indexing {len(weighted_results)} enhanced web chunks from {url}")
-            
-            def store_weighted_result(result):
-                try:
-                    emb, meta = result
-                    store(emb, meta, "web")
-                except Exception as e:
-                    logger.error(f"Error storing enhanced web result: {e}")
-            
-            with ThreadPoolExecutor(max_workers=4) as executor:
-                futures = [executor.submit(store_weighted_result, result) for result in weighted_results]
-                for future in as_completed(futures):
-                    try:
-                        future.result()
-                    except Exception as e:
-                        logger.error(f"Error in enhanced web processing: {e}")
-            
-            logger.info(f"Successfully indexed web file with rich metadata: {url}")
-            
-        except Exception as e:
-            logger.error(f"Web indexing failed for {url}: {e}")
-        return
-    else:
-        logger.info(f"Skipping unsupported or binary file: {url} (detected type: {filetype})")
-        return
-
 def extract_txid_or_arns_name(url):
     # Match either a txid (43+ chars) or an ARNS name (subdomain)
     # Example: https://arweave.net/<txid>
@@ -915,571 +886,273 @@ def normalize_url(url):
     )
     return urlunparse(normalized)
 
-# ARNS functionality now handled by ChromaDB collections
-
-def index_file(url, is_arns=False, force_web=False):
-    """Enhanced file indexing with better web content handling."""
-    return enhanced_index_file(url, is_arns, force_web)
-
-# ==== Additional Web Indexing Improvements ====
-def validate_web_content(url, html_content):
-    """Validate that the content is actually a webpage and not an error page."""
-    if not html_content or len(html_content.strip()) < 100:
-        return False, "Content too short"
-    
-    # Check for common error indicators
-    error_indicators = [
-        "404", "not found", "error", "page not found", "access denied",
-        "forbidden", "unauthorized", "server error", "maintenance"
-    ]
-    
-    content_lower = html_content.lower()
-    for indicator in error_indicators:
-        if indicator in content_lower:
-            return False, f"Error indicator found: {indicator}"
-    
-    # Check for basic HTML structure
-    if not ('<html' in content_lower or '<body' in content_lower):
-        return False, "No HTML structure found"
-    
-    return True, "Valid content"
-
-def extract_main_content(soup):
-    """Extract main content using various heuristics."""
-    # Remove common non-content elements
-    for tag in soup(['script', 'style', 'nav', 'header', 'footer', 'aside', 'advertisement']):
+def parse_webpage(html):
+    soup = BeautifulSoup(html, "html.parser")
+    # Remove unnecessary tags
+    for tag in soup([
+        "script", "style", "noscript", "header", "footer", "nav", "aside", "form", "input", "svg", "canvas", "iframe", "button", "figure", "img", "link", "meta", "object", "embed", "applet", "base", "map", "area", "track", "audio", "video"
+    ]):
         tag.decompose()
-    
-    # Try to find main content area
-    main_selectors = [
-        'main',
-        '[role="main"]',
-        '.main-content',
-        '.content',
-        '#content',
-        '#main',
-        'article',
-        '.post-content',
-        '.entry-content'
-    ]
-    
-    for selector in main_selectors:
-        main_content = soup.select_one(selector)
-        if main_content:
-            return main_content
-    
-    # Fallback to body if no main content found
-    return soup.find('body') or soup
-
-def create_semantic_chunks(text_elements, max_chunk_size=1000, min_chunk_size=100):
-    """Create semantic chunks from text elements."""
+    # Extract SEO meta tags
+    def get_meta_content(names):
+        for name in names:
+            tag = soup.find("meta", attrs={"name": name})
+            if tag and tag.get("content"):
+                return tag["content"].strip()
+            tag = soup.find("meta", attrs={"property": name})
+            if tag and tag.get("content"):
+                return tag["content"].strip()
+        return ""
+    title = get_meta_content(["og:title", "twitter:title"]) or (soup.title.string.strip() if soup.title and soup.title.string else "")
+    meta_desc = get_meta_content(["description", "og:description", "twitter:description"])
+    # Section-aware chunking, clean whitespace
     chunks = []
-    current_chunk = []
-    current_size = 0
-    
-    for elem in text_elements:
-        text = elem['text']
-        text_size = len(text)
-        
-        # If adding this text would make chunk too large, save current chunk
-        if current_size + text_size > max_chunk_size and current_chunk:
-            chunk_text = ' '.join([e['text'] for e in current_chunk])
-            if len(chunk_text) >= min_chunk_size:
-                chunks.append({
-                    'text': chunk_text,
-                    'elements': current_chunk.copy()
-                })
-            current_chunk = []
-            current_size = 0
-        
-        current_chunk.append(elem)
-        current_size += text_size
-    
-    # Add final chunk
-    if current_chunk:
-        chunk_text = ' '.join([e['text'] for e in current_chunk])
-        if len(chunk_text) >= min_chunk_size:
-            chunks.append({
-                'text': chunk_text,
-                'elements': current_chunk
-            })
-    
+    current_heading = title
+    for elem in soup.find_all(["h1", "h2", "h3", "p"]):
+        if elem.name in ["h1", "h2", "h3"]:
+            current_heading = elem.get_text(strip=True)
+        elif elem.name == "p":
+            text = elem.get_text(" ", strip=True)
+            text = ' '.join(text.split())  # Remove extra spaces
+            if text:
+                chunk = {
+                    "title": title,
+                    "section": current_heading,
+                    "text": text,
+                    "meta_desc": meta_desc
+                }
+                chunks.append(chunk)
     return chunks
 
-def enhanced_parse_webpage(html, url):
-    """Enhanced webpage parsing with better content extraction."""
+# ARNS-exclusive index/meta
+ARNS_INDEX_FILE = os.path.join(DATA_DIR, "arns_index.npy")
+ARNS_META_FILE = os.path.join(DATA_DIR, "arns_meta.json")
+def load_arns_index():
     try:
-        soup = BeautifulSoup(html, "html.parser")
-        
-        # Validate content
-        is_valid, reason = validate_web_content(url, html)
-        if not is_valid:
-            logger.warning(f"Invalid web content for {url}: {reason}")
-            return []
-        
-        # Extract rich metadata
-        metadata = extract_rich_metadata(soup, url)
-        
-        # Extract main content
-        main_content = extract_main_content(soup)
-        
-        # Get text elements with hierarchy
-        text_elements = []
-        
-        for elem in main_content.find_all(["h1", "h2", "h3", "h4", "h5", "h6", "p", "div", "span", "li", "td", "th"]):
-            text = elem.get_text(" ", strip=True)
-            if text and len(text.strip()) > 10:
-                # Determine heading level
-                level = 0
-                if elem.name.startswith('h'):
-                    level = int(elem.name[1])
-                
-                text_elements.append({
-                    'tag': elem.name,
-                    'text': clean_text(text),
-                    'level': level,
-                    'element': elem
-                })
-        
-        # Create semantic chunks
-        chunks = create_semantic_chunks(text_elements)
-        
-        # Convert chunks to the expected format
-        result_chunks = []
-        for i, chunk in enumerate(chunks):
-            # Find the most relevant heading for this chunk
-            chunk_elements = chunk['elements']
-            section = metadata.get('title', '')
-            
-            # Look for the closest heading
-            for elem in chunk_elements:
-                if elem['tag'].startswith('h'):
-                    section = elem['text']
-                    break
-            
-            result_chunk = {
-                "title": metadata.get('title', ''),
-                "section": section,
-                "text": chunk['text'],
-                "meta_desc": metadata.get('description', ''),
-                "author": metadata.get('author', ''),
-                "keywords": metadata.get('keywords', ''),
-                "language": metadata.get('language', ''),
-                "tag": "div",
-                "chunk_index": i
-            }
-            result_chunks.append(result_chunk)
-        
-        logger.info(f"Enhanced parsing: {len(result_chunks)} chunks from {url}")
-        return result_chunks
-        
+        if os.path.exists(ARNS_INDEX_FILE):
+            arr = np.load(ARNS_INDEX_FILE)
+            if arr.shape[1] != 1024:
+                logger.warning(f"ARNS index file has wrong shape {arr.shape}, recreating.")
+                return np.empty((0, 1024), dtype=np.float32)
+            return arr
+        else:
+            return np.empty((0, 1024), dtype=np.float32)
     except Exception as e:
-        logger.error(f"Error in enhanced webpage parsing for {url}: {e}")
-        return []
-
-def robust_web_indexing(url, is_arns=False):
-    """Robust web indexing with multiple fallback strategies."""
+        logger.error(f"Failed to load ARNS index: {e}. Recreating empty index.")
+        return np.empty((0, 1024), dtype=np.float32)
+def load_arns_meta():
     try:
-        # Strategy 1: Direct HTML fetch with enhanced parsing
-        html_content = None
-        for test_url in arweave_domain_fallback_urls(url):
-            try:
-                resp = requests.get(test_url, timeout=30, headers={
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        if os.path.exists(ARNS_META_FILE):
+            with open(ARNS_META_FILE) as f:
+                return json.load(f)
+        else:
+            return {}
+    except Exception as e:
+        logger.error(f"Failed to load ARNS meta: {e}. Recreating empty meta.")
+        return {}
+def save_arns_index(index):
+    try:
+        np.save(ARNS_INDEX_FILE, index)
+        logger.info(f"ARNS index file saved: {ARNS_INDEX_FILE}")
+    except Exception as e:
+        logger.error(f"Failed to save ARNS index: {e}")
+def save_arns_meta(meta):
+    try:
+        with open(ARNS_META_FILE, "w") as f:
+            json.dump(meta, f)
+        logger.info(f"ARNS meta file saved: {ARNS_META_FILE}")
+    except Exception as e:
+        logger.error(f"Failed to save ARNS meta: {e}")
+
+# ChromaDB handles ARNS storage automatically
+
+def index_file(url, is_arns=False, force_web=False):
+    return enhanced_index_file(url, is_arns, force_web)
+
+# --- Enhanced Web Indexing and Retrieval (copied from working multimodal ver.py) ---
+
+def enhanced_index_file(url, is_arns=False, force_web=False):
+    """Enhanced file indexing with better web content handling."""
+    normalized_url = normalize_url(url)
+    # Deduplication: skip if normalized_url already indexed
+    with indexed_txids_lock:
+        if normalized_url in indexed_txids:
+            logger.info(f"Skipping already indexed normalized URL: {normalized_url}")
+            return
+    if force_web:
+        filetype = "web"
+    else:
+        filetype = detect_file_type(url)
+    if filetype == "pdf":
+        logger.info(f"Skipping PDF file: {url}")
+        return
+    if filetype == "image":
+        emb, modality = embed_image(url), "image"
+        if emb is not None:
+            meta = {"txid": extract_txid_or_arns_name(url), "url": url, "title": url, "chunk": "", "description": f"{modality} from {url}", "modality": modality}
+            store_in_chromadb(emb, meta, modality)
+            logger.info(f"Indexed {modality} file: {url}")
+        else:
+            logger.error(f"Embedding failed for {modality} file: {url}")
+        return
+    elif filetype == "audio":
+        emb, modality = embed_audio(url), "audio"
+        if emb is not None:
+            meta = {"txid": extract_txid_or_arns_name(url), "url": url, "title": url, "chunk": "", "description": f"{modality} from {url}", "modality": modality}
+            store_in_chromadb(emb, meta, modality)
+            logger.info(f"Indexed {modality} file: {url}")
+        else:
+            logger.error(f"Embedding failed for {modality} file: {url}")
+        return
+    elif filetype == "video":
+        emb, modality = embed_video(url), "video"
+        if emb is not None:
+            meta = {"txid": extract_txid_or_arns_name(url), "url": url, "title": url, "chunk": "", "description": f"{modality} from {url}", "modality": modality}
+            store_in_chromadb(emb, meta, modality)
+            logger.info(f"Indexed {modality} file: {url}")
+        else:
+            logger.error(f"Embedding failed for {modality} file: {url}")
+        return
+    elif filetype == "web":
+        try:
+            weighted_results = enhanced_webpage_indexing_with_metadata(url, is_arns)
+            if not weighted_results:
+                logger.warning(f"No valid content extracted from {url}")
+                return
+            logger.info(f"Indexing {len(weighted_results)} enhanced web chunks from {url}")
+            def store_weighted_result(result):
+                try:
+                    emb, meta = result
+                    store_in_chromadb(emb, meta, "web")
+                except Exception as e:
+                    logger.error(f"Error storing enhanced web result: {e}")
+            with ThreadPoolExecutor(max_workers=4) as executor:
+                futures = [executor.submit(store_weighted_result, result) for result in weighted_results]
+                for future in as_completed(futures):
+                    try:
+                        future.result()
+                    except Exception as e:
+                        logger.error(f"Error in enhanced web processing: {e}")
+            logger.info(f"Successfully indexed web file with rich metadata: {url}")
+        except Exception as e:
+            logger.error(f"Web indexing failed for {url}: {e}")
+        return
+    else:
+        logger.info(f"Skipping unsupported or binary file: {url} (detected type: {filetype})")
+        return
+
+
+
+def enhanced_search_modality(query: str, top_k: int, modality: str):
+    logger.info(f"Enhanced search called for modality '{modality}' with query '{query}' and top_k={top_k}")
+    try:
+        collection = collections.get(modality)
+        if not collection:
+            logger.warning(f"No ChromaDB collection for modality '{modality}'")
+            return {"results": []}
+        enhanced_query = query.strip()
+        if modality == "web":
+            enhanced_query = f"Search query: {enhanced_query}"
+        query_embedding = embed_text(enhanced_query)
+        results = collection.query(
+            query_embeddings=[query_embedding.tolist()],
+            n_results=top_k * 5,
+            include=["metadatas", "documents", "distances"]
+        )
+        if not results['ids'] or not results['ids'][0]:
+            logger.warning(f"No results found for modality '{modality}'")
+            return {"results": []}
+        raw_results = []
+        for i, (id_val, metadata, document, distance) in enumerate(zip(
+            results['ids'][0], 
+            results['metadatas'][0], 
+            results['documents'][0], 
+            results['distances'][0]
+        )):
+            if metadata and document:
+                score = 1.0 - (distance / 2.0)
+                adjusted_score = score
+                if modality == "web":
+                    content_type = metadata.get("content_type", "")
+                    content_quality = metadata.get("content_quality", "normal")
+                    url = metadata.get("url", "")
+                    if content_quality == "high":
+                        adjusted_score *= 1.3
+                    elif content_quality == "medium":
+                        adjusted_score *= 1.1
+                    if content_type == "title":
+                        adjusted_score *= 1.8
+                    elif content_type == "description":
+                        adjusted_score *= 1.4
+                    elif content_type == "summary":
+                        adjusted_score *= 1.6
+                    if metadata.get("embedding_enhanced"):
+                        adjusted_score *= 1.2
+                    query_lower = query.lower()
+                    url_lower = url.lower()
+                    title_lower = metadata.get("web_loader_title", "").lower()
+                    desc_lower = metadata.get("web_loader_description", "").lower()
+                    chunk_lower = metadata.get("chunk", "").lower()
+                    if query_lower in url_lower:
+                        adjusted_score *= 5.0
+                        logger.info(f"Exact domain match found: {query} in {url}")
+                    elif metadata.get("domain_boost"):
+                        adjusted_score *= metadata.get("domain_boost", 1.0)
+                        logger.info(f"Domain boost applied: {metadata.get('domain_boost')}")
+                    elif query_lower in title_lower:
+                        adjusted_score *= 2.5
+                        logger.info(f"Title match found: {query} in title")
+                    elif query_lower in desc_lower:
+                        adjusted_score *= 2.0
+                        logger.info(f"Description match found: {query} in description")
+                    elif query_lower in chunk_lower:
+                        adjusted_score *= 1.5
+                        logger.info(f"Content match found: {query} in chunk")
+                raw_results.append({
+                    "score": adjusted_score,
+                    "original_score": score,
+                    "content_quality": metadata.get("content_quality", "normal"),
+                    "content_type": metadata.get("content_type", ""),
+                    **metadata,
+                    "chunk": document
                 })
-                resp.raise_for_status()
-                html_content = resp.text
-                break
-            except Exception as e:
-                logger.warning(f"Direct fetch failed for {test_url}: {e}")
+        raw_results.sort(key=lambda x: -x['score'])
+        SCORE_GROUP_THRESHOLD = 0.02
+        grouped = []
+        used = [False] * len(raw_results)
+        for i, res in enumerate(raw_results):
+            if used[i]:
                 continue
-        
-        if html_content:
-            chunks = enhanced_parse_webpage(html_content, url)
-            if chunks:
-                return chunks
-        
-        # Strategy 2: WebBaseLoader fallback
-        try:
-            title, content, description = fetch_webpage_text(url)
-            if content and len(content.strip()) > 100:
-                # Create chunks from the content
-                words = content.split()
-                chunk_size = 200
-                chunks = []
-                
-                for i in range(0, len(words), chunk_size):
-                    chunk_text = " ".join(words[i:i + chunk_size])
-                    if is_valid_content(chunk_text):
-                        chunk = {
-                            "title": title or url,
-                            "section": "Content",
-                            "text": chunk_text,
-                            "meta_desc": description,
-                            "author": "",
-                            "keywords": "",
-                            "language": "",
-                            "tag": "div",
-                            "chunk_index": len(chunks)
-                        }
-                        chunks.append(chunk)
-                
-                if chunks:
-                    logger.info(f"WebBaseLoader fallback: {len(chunks)} chunks from {url}")
-                    return chunks
-        except Exception as e:
-            logger.warning(f"WebBaseLoader fallback failed for {url}: {e}")
-        
-        # Strategy 3: Minimal content extraction
-        try:
-            # Try to extract any meaningful text
-            if html_content:
-                soup = BeautifulSoup(html_content, "html.parser")
-                text = soup.get_text(" ", strip=True)
-                text = clean_text(text)
-                
-                if is_valid_content(text):
-                    chunk = {
-                        "title": url,
-                        "section": "Content",
-                        "text": text[:2000],  # Limit length
-                        "meta_desc": "",
-                        "author": "",
-                        "keywords": "",
-                        "language": "",
-                        "tag": "div",
-                        "chunk_index": 0
-                    }
-                    logger.info(f"Minimal extraction: 1 chunk from {url}")
-                    return [chunk]
-        except Exception as e:
-            logger.warning(f"Minimal extraction failed for {url}: {e}")
-        
-        logger.warning(f"All web indexing strategies failed for {url}")
-        return []
-        
+            group = [res]
+            used[i] = True
+            for j in range(i + 1, len(raw_results)):
+                if used[j]:
+                    continue
+                if (abs(res['original_score'] - raw_results[j]['original_score']) < SCORE_GROUP_THRESHOLD and
+                    res.get('url') == raw_results[j].get('url')):
+                    group.append(raw_results[j])
+                    used[j] = True
+            group.sort(key=lambda x: -x['score'])
+            main = group[0]
+            duplicates = group[1:]
+            main['duplicates'] = duplicates
+            main['has_duplicates'] = len(duplicates) > 0
+            grouped.append(main)
+        grouped.sort(key=lambda x: -x['score'])
+        grouped = grouped[:top_k]
+        logger.info(f"Enhanced search for modality '{modality}' returned {len(grouped)} grouped results (top_k={top_k}).")
+        return {"results": grouped}
     except Exception as e:
-        logger.error(f"Robust web indexing failed for {url}: {e}")
-        return []
+        logger.error(f"Error in enhanced search for modality '{modality}': {e}")
+        return {"results": []}
 
-# ==== Strict Webpage Detection and Content Validation ====
-def is_valid_content(content):
-    """
-    Check if content is valid for indexing.
-    Returns True if content is meaningful, False otherwise.
-    """
-    if not content:
-        return False
-    
-    # Remove whitespace and check if empty
-    stripped = content.strip()
-    if not stripped:
-        return False
-    
-    # Check if content is too short (likely not meaningful)
-    if len(stripped) < 50:
-        return False
-    
-    # Check if content is mostly whitespace or special characters
-    text_ratio = len(re.findall(r'[a-zA-Z0-9]', stripped)) / len(stripped)
-    if text_ratio < 0.3:  # Less than 30% actual text
-        return False
-    
-    # Check for common meaningless patterns
-    meaningless_patterns = [
-        r'^\s*$',  # Only whitespace
-        r'^[^\w]*$',  # Only special characters
-        r'^(Loading|Error|404|Not Found|Access Denied)',  # Error pages
-        r'^\s*(javascript|css|html|xml)\s*$',  # Just tech terms
-    ]
-    
-    for pattern in meaningless_patterns:
-        if re.match(pattern, stripped, re.IGNORECASE):
-            return False
-    
-    return True
-
-def check_webpage(url):
-    """
-    Checks if the given URL points to a webpage (HTML content).
-    Returns True if the content appears to be a webpage, False otherwise.
-    """
-    try:
-        resp = requests.get(url, timeout=5)
-        text = resp.text
-        if "<!doctype html" in text.lower() or "<html" in text.lower():
-            return True
-        if any(tag in text.lower() for tag in ["<head", "<body", "<title", "<meta"]):
-            return True
-        return False
-    except Exception:
-        return False
-
-def extract_and_weight_content(soup, url):
-    """
-    Extract content with title weighting and optimal meta tag cleaning.
-    Returns weighted content chunks optimized for embedding.
-    """
-    # Extract title with high priority
-    title = ""
-    title_selectors = [
-        'meta[property="og:title"]',
-        'meta[name="twitter:title"]', 
-        'meta[name="title"]',
-        'title'
-    ]
-    
-    for selector in title_selectors:
-        tag = soup.select_one(selector)
-        if tag:
-            if tag.name == 'meta':
-                title = tag.get('content', '').strip()
-            else:
-                title = tag.get_text(strip=True)
-            if title and is_valid_content(title):
-                break
-    
-    # Clean and validate title
-    if title:
-        title = clean_text(title)
-        if not is_valid_content(title):
-            title = ""
-    
-    # Extract meta description
-    meta_desc = ""
-    desc_selectors = [
-        'meta[name="description"]',
-        'meta[property="og:description"]',
-        'meta[name="twitter:description"]'
-    ]
-    
-    for selector in desc_selectors:
-        tag = soup.select_one(selector)
-        if tag and tag.get('content'):
-            meta_desc = clean_text(tag['content'].strip())
-            if is_valid_content(meta_desc):
-                break
-    
-    # Extract main content
-    main_content = extract_main_content(soup)
-    
-    # Create weighted content chunks
-    chunks = []
-    
-    # 1. Title chunk (highest weight)
-    if title:
-        chunks.append({
-            'text': title,
-            'weight': 3.0,  # High weight for title
-            'type': 'title',
-            'section': 'Title'
-        })
-    
-    # 2. Meta description chunk (medium weight)
-    if meta_desc:
-        chunks.append({
-            'text': meta_desc,
-            'weight': 2.0,  # Medium weight for description
-            'type': 'description',
-            'section': 'Description'
-        })
-    
-    # 3. Main content chunks (normal weight)
-    text_elements = []
-    for elem in main_content.find_all(["h1", "h2", "h3", "h4", "h5", "h6", "p", "div", "span", "li", "td", "th"]):
-        text = elem.get_text(" ", strip=True)
-        if text and len(text.strip()) > 10:
-            level = 0
-            if elem.name.startswith('h'):
-                level = int(elem.name[1])
-            
-            text_elements.append({
-                'tag': elem.name,
-                'text': clean_text(text),
-                'level': level,
-                'element': elem
-            })
-    
-    # Create semantic chunks from main content
-    content_chunks = create_semantic_chunks(text_elements)
-    
-    for i, chunk in enumerate(content_chunks):
-        if is_valid_content(chunk['text']):
-            # Find relevant heading for this chunk
-            section = title or "Content"
-            for elem in chunk['elements']:
-                if elem['tag'].startswith('h'):
-                    section = elem['text']
-                    break
-            
-            chunks.append({
-                'text': chunk['text'],
-                'weight': 1.0,  # Normal weight for content
-                'type': 'content',
-                'section': section,
-                'chunk_index': i
-            })
-    
-    return chunks, title, meta_desc
-
-def create_weighted_embeddings(chunks, url, is_arns=False):
-    """
-    Optimized embedding creation with intelligent text processing and minimal redundancy.
-    """
-    results = []
-    
-    for chunk in chunks:
-        try:
-            original_text = chunk['text']
-            
-            # Optimized embedding text creation based on chunk type
-            if chunk['type'] == 'title':
-                # For titles, emphasize key terms without redundancy
-                embedding_text = original_text
-                # Add domain context if available
-                if 'arlink' in url.lower() or 'arweave' in url.lower():
-                    embedding_text = f"Arweave content: {embedding_text}"
-            elif chunk['type'] == 'content':
-                # For content, use as-is (already optimized by extract_key_content)
-                embedding_text = original_text
-            else:
-                # For other types, use as-is
-                embedding_text = original_text
-            
-            # Create embedding
-            emb = embed_text(embedding_text)
-            
-            # Streamlined metadata creation
-            meta = {
-                "txid": extract_txid_or_arns_name(url),
-                "url": url,
-                "normalized_url": normalize_url(url),
-                "title": chunk.get('section', ''),
-                "section": chunk['section'],
-                "chunk": chunk['text'],
-                "description": chunk.get('text', ''),
-                "content_type": chunk['type'],
-                "weight": chunk['weight'],
-                "chunk_index": chunk.get('chunk_index', 0),
-                "content_quality": chunk.get('content_quality', 'normal'),
-                "chunk_length": chunk.get('chunk_length', len(chunk['text'])),
-                "modality": "web",
-                "embedding_enhanced": True,
-                "efficient_indexing": True,
-                "processing_version": "2.0"  # Track optimization version
-            }
-            
-            # Add essential WebBaseLoader metadata
-            if 'web_loader_title' in chunk:
-                meta.update({
-                    "web_loader_title": chunk['web_loader_title'],
-                    "web_loader_description": chunk['web_loader_description'],
-                    "web_loader_content": chunk['web_loader_content']
-                })
-            
-            results.append((emb, meta))
-            
-        except Exception as e:
-            logger.error(f"Error creating optimized embedding for chunk: {e}")
-    
-    return results
-
-def strict_webpage_indexing(url, is_arns=False):
-    """
-    Strict webpage indexing with title weighting and optimal content cleaning.
-    """
-    try:
-        # First, check if it's actually a webpage
-        if not check_webpage(url):
-            logger.info(f"Skipping {url} - not a valid webpage")
-            return []
-        
-        # Fetch content with multiple fallback strategies
-        html_content = None
-        
-        # Strategy 1: Direct fetch
-        for test_url in arweave_domain_fallback_urls(url):
-            try:
-                resp = requests.get(test_url, timeout=30, headers={
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-                })
-                resp.raise_for_status()
-                html_content = resp.text
-                break
-            except Exception as e:
-                logger.warning(f"Direct fetch failed for {test_url}: {e}")
-                continue
-        
-        if not html_content:
-            # Strategy 2: WebBaseLoader fallback
-            try:
-                title, content, description = fetch_webpage_text(url)
-                if content and is_valid_content(content):
-                    # Create simple weighted chunks
-                    chunks = []
-                    if title and is_valid_content(title):
-                        chunks.append({
-                            'text': title,
-                            'weight': 3.0,
-                            'type': 'title',
-                            'section': 'Title'
-                        })
-                    if description and is_valid_content(description):
-                        chunks.append({
-                            'text': description,
-                            'weight': 2.0,
-                            'type': 'description',
-                            'section': 'Description'
-                        })
-                    if content and is_valid_content(content):
-                        # Split content into chunks
-                        words = content.split()
-                        chunk_size = 200
-                        for i in range(0, len(words), chunk_size):
-                            chunk_text = " ".join(words[i:i + chunk_size])
-                            if is_valid_content(chunk_text):
-                                chunks.append({
-                                    'text': chunk_text,
-                                    'weight': 1.0,
-                                    'type': 'content',
-                                    'section': 'Content',
-                                    'chunk_index': len(chunks)
-                                })
-                    
-                    if chunks:
-                        return create_weighted_embeddings(chunks, url, is_arns)
-            except Exception as e:
-                logger.warning(f"WebBaseLoader fallback failed for {url}: {e}")
-        
-        # Strategy 3: Enhanced parsing with weighting
-        if html_content:
-            soup = BeautifulSoup(html_content, "html.parser")
-            chunks, title, meta_desc = extract_and_weight_content(soup, url)
-            
-            if chunks:
-                return create_weighted_embeddings(chunks, url, is_arns)
-        
-        logger.warning(f"No valid content extracted from {url}")
-        return []
-        
-    except Exception as e:
-        logger.error(f"Strict webpage indexing failed for {url}: {e}")
-        return []
-
-# ==== Initialize ====
-print("🔄 Initializing ChromaDB-based indexer...")
-
-# Initialize indexed_txids for deduplication
+print("🔄 ChromaDB collections initialized...")
 indexed_txids = set()
 indexed_txids_lock = threading.Lock()
-
-# Load cursors for indexing loops
 cursor_web = load_cursor("web")
 cursor_image = load_cursor("image")
 cursor_audio = load_cursor("audio")
 cursor_video = load_cursor("video")
-
-print(f"✅ ChromaDB collections initialized")
 print(f"✅ Current cursors: web={cursor_web if cursor_web else 'None'}, image={cursor_image if cursor_image else 'None'}, audio={cursor_audio if cursor_audio else 'None'}, video={cursor_video if cursor_video else 'None'}")
 
 # Initialize locks for thread safety
@@ -1487,11 +1160,9 @@ metas_locks = {m: threading.Lock() for m in MODALITIES}
 metas_locks['all'] = threading.Lock()
 
 def store(emb, meta, modality):
-    """
-    Store embedding and metadata in ChromaDB.
-    """
+    """Store embedding and metadata using ChromaDB."""
     try:
-        # Store in the appropriate collection
+        # Store in main modality collection
         success = store_in_chromadb(emb, meta, modality)
         
         if success:
@@ -1515,844 +1186,6 @@ def store(emb, meta, modality):
     except Exception as e:
         logger.error(f"Error storing embedding for {modality}: {e}")
         return False
-
-# ==== FastAPI ARNS flag endpoint ====
-ENABLE_ARNS = os.getenv("ENABLE_ARNS", "true").lower() == "true"
-
-app = FastAPI()
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
-
-class SearchRequest(BaseModel):
-    query: str
-    top_k: int = TOP_K
-
-@app.get("/")
-def root():
-    logger.info("Root endpoint called.")
-    return {"message": "Multimodal Arweave Search (CUVS + ImageBind)"}
-
-@app.get("/status")
-def status():
-    logger.info("Status endpoint called.")
-    status_data = {}
-    
-    try:
-        for modality in MODALITIES:
-            collection = collections.get(modality)
-            if collection:
-                count = collection.count()
-                status_data[modality] = count
-            else:
-                status_data[modality] = 0
-        
-        # Add ARNS collection count
-        if arns_collection:
-            status_data["arns"] = arns_collection.count()
-        else:
-            status_data["arns"] = 0
-            
-    except Exception as e:
-        logger.error(f"Error getting status: {e}")
-        status_data = {m: 0 for m in MODALITIES}
-        status_data["arns"] = 0
-    
-    return status_data
-
-# Old search_modality function removed - using enhanced_search_modality instead
-
-def enhanced_search_modality(query: str, top_k: int, modality: str):
-    """
-    Enhanced search with ChromaDB and improved weighting for better search results.
-    """
-    logger.info(f"Enhanced search called for modality '{modality}' with query '{query}' and top_k={top_k}")
-    
-    try:
-        # Get the appropriate collection
-        collection = collections.get(modality)
-        if not collection:
-            logger.warning(f"No ChromaDB collection for modality '{modality}'")
-            return {"results": []}
-        
-        # Create query embedding with enhanced processing
-        enhanced_query = query.strip()
-        if modality == "web":
-            # Add context to web queries for better matching
-            enhanced_query = f"Search query: {enhanced_query}"
-        
-        query_embedding = embed_text(enhanced_query)
-        
-        # Search in ChromaDB with more results for better selection
-        results = collection.query(
-            query_embeddings=[query_embedding.tolist()],
-            n_results=top_k * 5,  # Get more results for better filtering
-            include=["metadatas", "documents", "distances"]
-        )
-        
-        if not results['ids'] or not results['ids'][0]:
-            logger.warning(f"No results found for modality '{modality}'")
-            return {"results": []}
-        
-        # Process results with enhanced scoring
-        raw_results = []
-        for i, (id_val, metadata, document, distance) in enumerate(zip(
-            results['ids'][0], 
-            results['metadatas'][0], 
-            results['documents'][0], 
-            results['distances'][0]
-        )):
-            if metadata and document:
-                # Convert distance to similarity score
-                score = 1.0 - (distance / 2.0)  # Normalize distance to 0-1 score
-                
-                # Enhanced content type weighting for web results
-                adjusted_score = score
-                if modality == "web":
-                    content_type = metadata.get("content_type", "")
-                    content_quality = metadata.get("content_quality", "normal")
-                    url = metadata.get("url", "")
-                    
-                    # Apply quality-based boosting
-                    if content_quality == "high":
-                        adjusted_score *= 1.3
-                    elif content_quality == "medium":
-                        adjusted_score *= 1.1
-                    
-                    # Apply content type boosting
-                    if content_type == "title":
-                        adjusted_score *= 1.8  # Highest boost for titles
-                    elif content_type == "description":
-                        adjusted_score *= 1.4  # High boost for descriptions
-                    elif content_type == "summary":
-                        adjusted_score *= 1.6  # High boost for summaries
-                    
-                    # Boost results with enhanced embeddings
-                    if metadata.get("embedding_enhanced"):
-                        adjusted_score *= 1.2
-                    
-                    # Special handling for ARNS domain searches with enhanced boosting
-                    query_lower = query.lower()
-                    url_lower = url.lower()
-                    title_lower = metadata.get("web_loader_title", "").lower()
-                    desc_lower = metadata.get("web_loader_description", "").lower()
-                    chunk_lower = metadata.get("chunk", "").lower()
-                    
-                    # Check for exact domain match (highest priority)
-                    if query_lower in url_lower:
-                        # Exact domain match gets maximum priority
-                        adjusted_score *= 5.0  # Increased from 3.0 to 5.0
-                        logger.info(f"Exact domain match found: {query} in {url}")
-                    # Check for domain boost metadata
-                    elif metadata.get("domain_boost"):
-                        adjusted_score *= metadata.get("domain_boost", 1.0)
-                        logger.info(f"Domain boost applied: {metadata.get('domain_boost')}")
-                    # Check for title match
-                    elif query_lower in title_lower:
-                        adjusted_score *= 2.5  # Increased from 2.0 to 2.5
-                        logger.info(f"Title match found: {query} in title")
-                    # Check for description match
-                    elif query_lower in desc_lower:
-                        adjusted_score *= 2.0  # Increased from 1.5 to 2.0
-                        logger.info(f"Description match found: {query} in description")
-                    # Check for content match
-                    elif query_lower in chunk_lower:
-                        adjusted_score *= 1.5  # Increased from 1.2 to 1.5
-                        logger.info(f"Content match found: {query} in chunk")
-                
-                raw_results.append({
-                    "score": adjusted_score,
-                    "original_score": score,
-                    "content_quality": metadata.get("content_quality", "normal"),
-                    "content_type": metadata.get("content_type", ""),
-                    **metadata,
-                    "chunk": document
-                })
-        
-        # Sort by adjusted score for better grouping
-        raw_results.sort(key=lambda x: -x['score'])
-        
-        # Group results by score (within threshold) with enhanced logic
-        SCORE_GROUP_THRESHOLD = 0.02  # Slightly higher threshold for better grouping
-        grouped = []
-        used = [False] * len(raw_results)
-        
-        for i, res in enumerate(raw_results):
-            if used[i]:
-                continue
-            group = [res]
-            used[i] = True
-            
-            for j in range(i + 1, len(raw_results)):
-                if used[j]:
-                    continue
-                # Group by similar scores and same URL for better organization
-                if (abs(res['original_score'] - raw_results[j]['original_score']) < SCORE_GROUP_THRESHOLD and
-                    res.get('url') == raw_results[j].get('url')):
-                    group.append(raw_results[j])
-                    used[j] = True
-            
-            # Sort group by adjusted score descending
-            group.sort(key=lambda x: -x['score'])
-            main = group[0]
-            duplicates = group[1:]
-            main['duplicates'] = duplicates
-            main['has_duplicates'] = len(duplicates) > 0
-            grouped.append(main)
-        
-        # Sort groups by main adjusted score descending and take top_k groups only
-        grouped.sort(key=lambda x: -x['score'])
-        grouped = grouped[:top_k]
-        
-        logger.info(f"Enhanced search for modality '{modality}' returned {len(grouped)} grouped results (top_k={top_k}).")
-        return {"results": grouped}
-        
-    except Exception as e:
-        logger.error(f"Error in enhanced search for modality '{modality}': {e}")
-        return {"results": []}
-
-def store_in_chromadb(emb, meta, modality, collection_name=None):
-    """
-    Store embedding and metadata in ChromaDB with simplified rich metadata.
-    """
-    try:
-        # Determine which collection to use
-        if collection_name == "arns":
-            collection = arns_collection
-        else:
-            collection = collections.get(modality)
-        
-        if not collection:
-            logger.error(f"No ChromaDB collection available for {modality}")
-            return False
-        
-        # Prepare simplified but comprehensive metadata for ChromaDB
-        chroma_metadata = {
-            # Core identification
-            "txid": meta.get("txid", ""),
-            "url": meta.get("url", ""),
-            "normalized_url": meta.get("normalized_url", ""),
-            
-            # Content information
-            "title": meta.get("title", ""),
-            "section": meta.get("section", ""),
-            "description": meta.get("description", ""),
-            "chunk": meta.get("chunk", ""),
-            
-            # Content classification
-            "modality": modality,
-            "content_type": meta.get("content_type", "content"),
-            "weight": meta.get("weight", 1.0),
-            "chunk_index": meta.get("chunk_index", 0),
-            
-            # Web-specific metadata
-            "author": meta.get("author", ""),
-            "keywords": meta.get("keywords", ""),
-            "language": meta.get("language", ""),
-            "tag": meta.get("tag", "div"),
-            
-            # WebBaseLoader metadata
-            "web_loader_title": meta.get("web_loader_title", ""),
-            "web_loader_description": meta.get("web_loader_description", ""),
-            "web_loader_content": meta.get("web_loader_content", ""),
-            
-            # ARNS status
-            "is_non_assigned_arns": meta.get("is_non_assigned_arns", False),
-            "arns_status": meta.get("arns_status", "assigned"),
-            
-            # Processing information
-            "processing_timestamp": str(int(time.time())),
-            "is_arns": meta.get("is_arns", False),
-            "original_modality": meta.get("original_modality", modality),
-            
-            # Content quality metrics
-            "text_length": len(meta.get("chunk", "")),
-            "word_count": len(meta.get("chunk", "").split()),
-            "has_title": bool(meta.get("title")),
-            "has_description": bool(meta.get("description")),
-        }
-        
-        # Add optional fields if they exist
-        optional_fields = [
-            "canonical_url", "robots", "viewport", "charset",
-            "domain", "path", "og_title", "og_description",
-            "twitter_title", "twitter_description"
-        ]
-        
-        for field in optional_fields:
-            if field in meta:
-                chroma_metadata[field] = meta[field]
-        
-        # Generate unique ID
-        unique_id = f"{modality}_{meta.get('txid', '')}_{meta.get('chunk_index', 0)}_{int(time.time())}"
-        
-        # Store in ChromaDB
-        collection.add(
-            embeddings=[emb.tolist()],
-            metadatas=[chroma_metadata],
-            documents=[meta.get("chunk", "")],
-            ids=[unique_id]
-        )
-        
-        logger.info(f"✅ Stored simplified metadata in ChromaDB: {modality} - {meta.get('url', '')}")
-        return True
-        
-    except Exception as e:
-        logger.error(f"Failed to store in ChromaDB: {e}")
-        return False
-
-def extract_enhanced_metadata(soup, url, web_loader_metadata=None):
-    """
-    Extract comprehensive metadata from both BeautifulSoup and WebBaseLoader.
-    This function is now primarily used for BeautifulSoup fallback scenarios.
-    """
-    metadata = {}
-    
-    # Extract basic metadata from BeautifulSoup
-    metadata.update(extract_rich_metadata(soup, url))
-    
-    # Add WebBaseLoader metadata if available
-    if web_loader_metadata:
-        metadata.update({
-            "web_loader_title": web_loader_metadata.get("title", ""),
-            "web_loader_description": web_loader_metadata.get("description", ""),
-            "web_loader_content": web_loader_metadata.get("content", ""),
-            "web_loader_language": web_loader_metadata.get("language", ""),
-            "web_loader_source": web_loader_metadata.get("source", "")
-        })
-    
-    # Detect non-assigned ARNS
-    section_text = metadata.get("section", "")
-    if "Future home of something rather bullish" in section_text:
-        metadata["is_non_assigned_arns"] = True
-        metadata["arns_status"] = "non_assigned"
-        metadata["content_type"] = "non_assigned_arns"
-    else:
-        metadata["is_non_assigned_arns"] = False
-        metadata["arns_status"] = "assigned"
-    
-    return metadata
-
-def enhanced_webpage_indexing_with_metadata(url, is_arns=False):
-    """
-    Enhanced webpage indexing using Langchain WebBaseLoader as primary method.
-    Falls back to BeautifulSoup only if WebBaseLoader fails.
-    Respects robots.txt for web crawling etiquette.
-    """
-    try:
-        # First, check if it's actually a webpage
-        if not check_webpage(url):
-            logger.info(f"Skipping {url} - not a valid webpage")
-            return []
-        
-        # Check robots.txt before proceeding
-        can_fetch = can_fetch_url(url)
-        if can_fetch is False:
-            logger.warning(f"Skipping {url} - robots.txt disallows crawling")
-            return []
-        elif can_fetch is True:
-            # Apply crawl delay if specified
-            crawl_delay = get_crawl_delay(url)
-            if crawl_delay > 0:
-                logger.info(f"Applying crawl delay of {crawl_delay} seconds for {url}")
-                time.sleep(crawl_delay)
-        
-        # Try WebBaseLoader as primary method
-        web_loader_metadata = None
-        web_loader_content = None
-        
-        for test_url in arweave_domain_fallback_urls(url):
-            try:
-                logger.info(f"Attempting WebBaseLoader for {test_url}")
-                loader = WebBaseLoader(test_url)
-                docs = loader.load()
-                
-                if docs:
-                    # Extract content from WebBaseLoader
-                    content = "\n".join([doc.page_content for doc in docs])
-                    
-                    # Extract metadata from first document
-                    first_doc = docs[0]
-                    title = first_doc.metadata.get("title", "") if hasattr(first_doc, 'metadata') else ""
-                    description = first_doc.metadata.get("description", "") if hasattr(first_doc, 'metadata') else ""
-                    
-                    # Create web loader metadata
-                    web_loader_metadata = {
-                        "title": title,
-                        "description": description,
-                        "content": content,
-                        "source": test_url,
-                        "language": first_doc.metadata.get("language", ""),
-                        "url": test_url
-                    }
-                    
-                    web_loader_content = content
-                    
-                    # Check if this is a standard unassigned ARNS page
-                    if title.strip() == "ArNS - Arweave Name System":
-                        logger.info(f"Skipping {test_url} - standard unassigned ARNS page")
-                        return []
-                    
-                    logger.info(f"✅ WebBaseLoader successful for {test_url}")
-                    break
-                    
-            except Exception as e:
-                logger.warning(f"WebBaseLoader failed for {test_url}: {e}")
-                continue
-        
-        # If WebBaseLoader failed, try BeautifulSoup as fallback
-        if not web_loader_metadata:
-            logger.info(f"WebBaseLoader failed, trying BeautifulSoup fallback for {url}")
-            
-            # Check robots.txt again for BeautifulSoup fallback (in case it changed)
-            can_fetch_fallback = can_fetch_url(url)
-            if can_fetch_fallback is False:
-                logger.warning(f"Skipping {url} - robots.txt disallows crawling (fallback)")
-                return []
-            elif can_fetch_fallback is True:
-                # Apply crawl delay if specified
-                crawl_delay = get_crawl_delay(url)
-                if crawl_delay > 0:
-                    logger.info(f"Applying crawl delay of {crawl_delay} seconds for {url} (fallback)")
-                    time.sleep(crawl_delay)
-            
-            # Fetch HTML content for BeautifulSoup
-            html_content = None
-            for test_url in arweave_domain_fallback_urls(url):
-                try:
-                    resp = requests.get(test_url, timeout=30, headers={
-                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-                    })
-                    resp.raise_for_status()
-                    html_content = resp.text
-                    break
-                except Exception as e:
-                    logger.warning(f"Direct fetch failed for {test_url}: {e}")
-                    continue
-            
-            if html_content:
-                soup = BeautifulSoup(html_content, "html.parser")
-                
-                # Extract content using BeautifulSoup
-                main_content = extract_main_content(soup)
-                content = main_content.get_text(" ", strip=True) if main_content else ""
-                
-                # Extract metadata using BeautifulSoup
-                title = ""
-                title_selectors = [
-                    'meta[property="og:title"]',
-                    'meta[name="twitter:title"]', 
-                    'meta[name="title"]',
-                    'title'
-                ]
-                
-                for selector in title_selectors:
-                    tag = soup.select_one(selector)
-                    if tag:
-                        if tag.name == 'meta':
-                            title = tag.get('content', '').strip()
-                        else:
-                            title = tag.get_text(strip=True)
-                        if title and is_valid_content(title):
-                            break
-                
-                # Extract description
-                description = ""
-                desc_selectors = [
-                    'meta[name="description"]',
-                    'meta[property="og:description"]',
-                    'meta[name="twitter:description"]'
-                ]
-                
-                for selector in desc_selectors:
-                    tag = soup.select_one(selector)
-                    if tag and tag.get('content'):
-                        description = tag['content'].strip()
-                        if is_valid_content(description):
-                            break
-                
-                web_loader_metadata = {
-                    "title": title,
-                    "description": description,
-                    "content": content,
-                    "source": url,
-                    "language": "",
-                    "url": url
-                }
-                
-                web_loader_content = content
-                
-                # Check if this is a standard unassigned ARNS page
-                if title.strip() == "ArNS - Arweave Name System":
-                    logger.info(f"Skipping {url} - standard unassigned ARNS page")
-                    return []
-                
-                logger.info(f"✅ BeautifulSoup fallback successful for {url}")
-        
-        # If we have content, process it
-        if web_loader_metadata and web_loader_content:
-            # Create enhanced metadata
-            enhanced_metadata = extract_enhanced_metadata_from_web_loader(web_loader_metadata, url)
-            
-            # Create weighted content chunks
-            chunks = create_weighted_chunks_from_web_loader(web_loader_metadata, enhanced_metadata)
-            
-            if chunks:
-                return create_weighted_embeddings(chunks, url, is_arns)
-        
-        logger.warning(f"No valid content extracted from {url}")
-        return []
-        
-    except Exception as e:
-        logger.error(f"Enhanced webpage indexing failed for {url}: {e}")
-        return []
-
-def extract_enhanced_metadata_from_web_loader(web_loader_metadata, url):
-    """
-    Extract enhanced metadata from WebBaseLoader results.
-    """
-    metadata = {
-        "url": url,
-        "web_loader_title": web_loader_metadata.get("title", ""),
-        "web_loader_description": web_loader_metadata.get("description", ""),
-        "web_loader_content": web_loader_metadata.get("content", ""),
-        "web_loader_language": web_loader_metadata.get("language", ""),
-        "web_loader_source": web_loader_metadata.get("source", ""),
-        "title": web_loader_metadata.get("title", ""),
-        "description": web_loader_metadata.get("description", ""),
-        "content_type": "webpage",
-        "domain": url.split("//")[-1].split("/")[0] if "//" in url else url,
-        "path": "/" + "/".join(url.split("//")[-1].split("/")[1:]) if "//" in url and len(url.split("//")[-1].split("/")) > 1 else "/",
-        "indexed_at": datetime.now().isoformat(),
-        "processing_method": "web_loader_primary"
-    }
-    
-    # Detect non-assigned ARNS
-    content = web_loader_metadata.get("content", "")
-    if "Future home of something rather bullish" in content:
-        metadata["is_non_assigned_arns"] = True
-        metadata["arns_status"] = "non_assigned"
-        metadata["content_type"] = "non_assigned_arns"
-    else:
-        metadata["is_non_assigned_arns"] = False
-        metadata["arns_status"] = "assigned"
-    
-    return metadata
-
-def create_weighted_chunks_from_web_loader(web_loader_metadata, enhanced_metadata):
-    """
-    Create efficient, high-quality content chunks from WebBaseLoader results.
-    Focus on the most important content with minimal redundancy.
-    """
-    chunks = []
-    
-    title = web_loader_metadata.get("title", "")
-    description = web_loader_metadata.get("description", "")
-    content = web_loader_metadata.get("content", "")
-    
-    def clean_and_enhance_text(text):
-        """Enhanced text cleaning for embeddings - aggressively removes noise and normalizes content"""
-        if not text:
-            return ""
-        
-        # Ultra-aggressive newline and whitespace removal
-        text = re.sub(r'\n+', ' ', text)
-        text = re.sub(r'\r+', ' ', text)
-        text = re.sub(r'\t+', ' ', text)
-        text = re.sub(r'\s+', ' ', text)
-        text = text.strip()
-        
-        # Remove HTML entities and tags
-        text = re.sub(r'&[a-zA-Z0-9#]+;', ' ', text)
-        text = re.sub(r'<[^>]+>', ' ', text)
-        text = re.sub(r'\s+', ' ', text)
-        
-        # Remove redundant content patterns
-        redundant_patterns = [
-            r'^\s*(loading|error|404|not found|access denied|page not found)\s*$',
-            r'^\s*(javascript|css|html|xml|json)\s*$',
-            r'^\s*[^\w\s]*\s*$',  # Only special characters
-            r'^\s*$',  # Only whitespace
-        ]
-        
-        for pattern in redundant_patterns:
-            if re.match(pattern, text, re.IGNORECASE):
-                return ""
-        
-        # Remove excessive repetition (same word repeated many times)
-        words = text.split()
-        if len(words) > 3:
-            word_counts = {}
-            for word in words:
-                word_counts[word.lower()] = word_counts.get(word.lower(), 0) + 1
-            
-            # If any word appears more than 50% of the time, it's likely noise
-            max_repetition = max(word_counts.values()) if word_counts else 0
-            if max_repetition > len(words) * 0.5:
-                return ""
-        
-        # Remove content that's mostly empty or just repeated characters
-        if len(text) < 5:
-            return ""
-        
-        # Check if content is mostly repeated characters
-        if len(set(text)) < 3 and len(text) > 10:
-            return ""
-        
-        # More lenient length requirements
-        if len(text) > 5000:
-            return ""
-        
-        return text
-    
-    def extract_key_content(text, max_length=600):
-        """Intelligent content extraction prioritizing relevance and coherence"""
-        if not text:
-            return ""
-        
-        # Clean the text
-        cleaned = clean_and_enhance_text(text)
-        if not cleaned:
-            return ""
-        
-        # If text is short enough, use it all
-        if len(cleaned) <= max_length:
-            return cleaned
-        
-        # Split into sentences more intelligently
-        sentences = re.split(r'[.!?]+', cleaned)
-        scored_sentences = []
-        
-        # Define relevance scoring
-        high_priority_terms = ['arlink', 'arweave', 'blockchain', 'web3', 'decentralized', 'permanent', 'storage']
-        medium_priority_terms = ['network', 'protocol', 'data', 'content', 'service', 'platform', 'app']
-        low_priority_terms = ['the', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 'of', 'with']
-        
-        for sentence in sentences:
-            sentence = sentence.strip()
-            if not sentence or len(sentence) < 8:
-                continue
-            
-            # Calculate sentence score
-            sentence_lower = sentence.lower()
-            high_score = sum(2 for term in high_priority_terms if term in sentence_lower)
-            medium_score = sum(1 for term in medium_priority_terms if term in sentence_lower)
-            low_score = sum(0.1 for term in low_priority_terms if term in sentence_lower)
-            
-            # Length bonus (prefer medium-length sentences)
-            length_bonus = 0
-            if 20 <= len(sentence) <= 100:
-                length_bonus = 1
-            elif len(sentence) > 100:
-                length_bonus = 0.5
-            
-            total_score = high_score + medium_score + low_score + length_bonus
-            
-            scored_sentences.append((sentence, total_score))
-        
-        # Sort by score and select top sentences
-        scored_sentences.sort(key=lambda x: x[1], reverse=True)
-        
-        selected_sentences = []
-        current_length = 0
-        
-        for sentence, score in scored_sentences:
-            if current_length + len(sentence) <= max_length:
-                selected_sentences.append(sentence)
-                current_length += len(sentence)
-            else:
-                break
-        
-        # If we have very few sentences, add some lower-scored ones
-        if len(selected_sentences) < 2 and len(scored_sentences) > 2:
-            for sentence, score in scored_sentences[2:]:
-                if current_length + len(sentence) <= max_length:
-                    selected_sentences.append(sentence)
-                    current_length += len(sentence)
-                else:
-                    break
-        
-        return '. '.join(selected_sentences) + '.' if selected_sentences else cleaned[:max_length]
-    
-    # Optimized chunking strategy - create only 2 high-quality chunks maximum
-    
-    # 1. Create a comprehensive title+description chunk (highest priority)
-    title_chunk_text = ""
-    if title and len(title.strip()) > 5:  # More lenient title validation
-        enhanced_title = clean_and_enhance_text(title)
-        if enhanced_title:
-            title_chunk_text = f"Title: {enhanced_title}"
-            if description and len(description.strip()) > 10:  # More lenient description validation
-                enhanced_desc = clean_and_enhance_text(description[:200])
-                title_chunk_text += f" - {enhanced_desc}"
-    
-    if title_chunk_text:
-        chunks.append({
-            'text': title_chunk_text,
-            'weight': 5.0,  # Highest weight for title chunk
-            'type': 'title',
-            'section': 'Title',
-            'content_quality': 'high',
-            'web_loader_title': title,
-            'web_loader_description': description,
-            'web_loader_content': content,
-            'chunk_length': len(title_chunk_text),
-            **enhanced_metadata
-        })
-    
-    # 2. Create a single, optimized content chunk (more lenient)
-    if content and len(content.strip()) > 20:  # More lenient content validation
-        key_content = extract_key_content(content)
-        if key_content and len(key_content) > 15:  # More lenient content requirement
-            # Create content chunk with context
-            content_chunk_text = key_content
-            if title:
-                content_chunk_text = f"Content about {title}: {content_chunk_text}"
-            
-            chunks.append({
-                'text': content_chunk_text,
-                'weight': 4.0,  # High weight for content
-                'type': 'content',
-                'section': 'Content',
-                'content_quality': 'high',
-                'chunk_length': len(content_chunk_text),
-                'web_loader_title': title,
-                'web_loader_description': description,
-                'web_loader_content': content,
-                **enhanced_metadata
-            })
-    
-    # Ensure we have at least one chunk (robust fallback)
-    if not chunks:
-        if title and len(title.strip()) > 3:
-            # Fallback: create minimal title chunk
-            chunks.append({
-                'text': f"Title: {title}",
-                'weight': 3.0,
-                'type': 'title',
-                'section': 'Title',
-                'content_quality': 'medium',
-                'web_loader_title': title,
-                'web_loader_description': description,
-                'web_loader_content': content,
-                'chunk_length': len(title),
-                **enhanced_metadata
-            })
-        elif content and len(content.strip()) > 10:
-            # Fallback: create content chunk from raw content
-            raw_content = content.strip()[:500]  # Limit to 500 chars
-            chunks.append({
-                'text': f"Content: {raw_content}",
-                'weight': 2.0,
-                'type': 'content',
-                'section': 'Content',
-                'content_quality': 'medium',
-                'web_loader_title': title,
-                'web_loader_description': description,
-                'web_loader_content': content,
-                'chunk_length': len(raw_content),
-                **enhanced_metadata
-            })
-        else:
-            # Last resort: create a basic chunk from URL
-            url_parts = url.split('/')
-            domain = url_parts[-1] if url_parts else url
-            chunks.append({
-                'text': f"Page: {domain}",
-                'weight': 1.0,
-                'type': 'title',
-                'section': 'Title',
-                'content_quality': 'low',
-                'web_loader_title': title,
-                'web_loader_description': description,
-                'web_loader_content': content,
-                'chunk_length': len(domain),
-                **enhanced_metadata
-            })
-    
-    return chunks
-
-# Update ARNS search endpoint to use ARNS-exclusive index/meta
-@app.get("/searchweb")
-def search_web(query: str, top_k: int = TOP_K, arns_only: bool = False):
-    if arns_only:
-        # Search ARNS-exclusive collection
-        try:
-            if not arns_collection:
-                logger.warning("No ARNS collection available")
-                return {"results": []}
-            
-            # Create query embedding
-            query_embedding = embed_text(query)
-            
-            # Search in ARNS collection
-            results = arns_collection.query(
-                query_embeddings=[query_embedding.tolist()],
-                n_results=top_k * 3,
-                include=["metadatas", "documents", "distances"]
-            )
-            
-            if not results['ids'] or not results['ids'][0]:
-                logger.warning("No ARNS results found")
-                return {"results": []}
-            
-            # Process results
-            raw_results = []
-            for i, (id_val, metadata, document, distance) in enumerate(zip(
-                results['ids'][0], 
-                results['metadatas'][0], 
-                results['documents'][0], 
-                results['distances'][0]
-            )):
-                if metadata and document:
-                    score = 1.0 - (distance / 2.0)
-                    raw_results.append({
-                        "score": score,
-                        **metadata,
-                        "chunk": document
-                    })
-            
-            # Group results
-            grouped = []
-            used = [False] * len(raw_results)
-            for i, res in enumerate(raw_results):
-                if used[i]:
-                    continue
-                group = [res]
-                used[i] = True
-                for j in range(i + 1, len(raw_results)):
-                    if used[j]:
-                        continue
-                    if abs(res['score'] - raw_results[j]['score']) < 0.01:
-                        group.append(raw_results[j])
-                        used[j] = True
-                group.sort(key=lambda x: -x['score'])
-                main = group[0]
-                duplicates = group[1:]
-                main['duplicates'] = duplicates
-                main['has_duplicates'] = len(duplicates) > 0
-                grouped.append(main)
-            
-            grouped.sort(key=lambda x: -x['score'])
-            grouped = grouped[:top_k]
-            logger.info(f"ARNS-only search returned {len(grouped)} grouped results (top_k={top_k}).")
-            return {"results": grouped}
-            
-        except Exception as e:
-            logger.error(f"ARNS search failed: {e}")
-            return {"results": []}
-    else:
-        return enhanced_search_modality(query, top_k, "web")
-
-@app.get("/searchimage")
-def search_image(query: str, top_k: int = TOP_K, arns_only: bool = False):
-    return enhanced_search_modality(query, top_k, "image")
-
-@app.get("/searchaudio")
-def search_audio(query: str, top_k: int = TOP_K, arns_only: bool = False):
-    return enhanced_search_modality(query, top_k, "audio")
-
-@app.get("/searchvideo")
-def search_video(query: str, top_k: int = TOP_K, arns_only: bool = False):
-    return enhanced_search_modality(query, top_k, "video")
 
 API_URL = "https://cu.ardrive.io/dry-run?process-id=qNvAoz0TgcH7DMg8BCVn8jF32QH5L6T29VjHxhHqqGE"
 HEADERS = {
@@ -2490,474 +1323,291 @@ def index_modality_loop(modality, content_types):
             logger.error(f"[{modality.capitalize()} Indexer Error] {e}")
             time.sleep(30)
 
+# --- FastAPI App Initialization (must be before any route decorators) ---
+app = FastAPI()
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 @app.on_event("startup")
 def startup():
     print("🚀 Starting Multimodal Arweave Indexer...")
     logger.info("App startup: launching background indexers.")
    # arns_index_once()  # Run ARNS indexing once at startup
-    #threading.Thread(target=lambda: index_modality_loop("image", ["image/png", "image/jpeg", "image/webp"]), daemon=True).start()
-    #threading.Thread(target=lambda: index_modality_loop("audio", ["audio/mpeg", "audio/wav", "audio/mp3"]), daemon=True).start()
-    #threading.Thread(target=lambda: index_modality_loop("video", ["video/mp4", "video/webm"]), daemon=True).start()
+    threading.Thread(target=lambda: index_modality_loop("image", ["image/png", "image/jpeg", "image/webp"]), daemon=True).start()
+    threading.Thread(target=lambda: index_modality_loop("audio", ["audio/mpeg", "audio/wav", "audio/mp3"]), daemon=True).start()
+    threading.Thread(target=lambda: index_modality_loop("video", ["video/mp4", "video/webm"]), daemon=True).start()
     threading.Thread(target=lambda: index_modality_loop("web", ["application/x.arweave-manifest+json", "text/html"]), daemon=True).start()
     threading.Thread(target=arns_index_loop, daemon=True).start()
 
-# ==== Test Functions ====
-def test_webpage_indexing():
-    """
-    Test the enhanced webpage indexing functionality with arlink.arweave.net
-    """
-    test_url = "https://arlink.arweave.net"
+class SearchRequest(BaseModel):
+    query: str
+    top_k: int = TOP_K
+
+@app.get("/")
+def root():
+    logger.info("Root endpoint called.")
+    return {
+        "message": "Multimodal Arweave Search (ChromaDB + ImageBind)", 
+        "version": "2.0",
+        "features": ["ChromaDB Vector Database", "ImageBind Embeddings", "Multi-modal Search"],
+        "status": "running"
+    }
+
+@app.get("/status")
+def status():
+    logger.info("Status endpoint called.")
+    status_data = {}
     
-    print(f"🧪 Testing enhanced webpage indexing with: {test_url}")
-    print("=" * 60)
-    
-    # Test 1: Check if it's a valid webpage
-    print("1. Testing webpage detection...")
-    is_webpage = check_webpage(test_url)
-    print(f"   ✅ Is webpage: {is_webpage}")
-    
-    if not is_webpage:
-        print("   ❌ Not a valid webpage, skipping further tests")
-        return
-    
-    # Test 2: Test content validation
-    print("\n2. Testing content validation...")
     try:
-        resp = requests.get(test_url, timeout=10)
-        content = resp.text
-        is_valid = is_valid_content(content[:500])  # Test first 500 chars
-        print(f"   ✅ Content validation: {is_valid}")
-    except Exception as e:
-        print(f"   ❌ Content validation failed: {e}")
-        return
-    
-    # Test 3: Test enhanced webpage indexing with metadata
-    print("\n3. Testing enhanced webpage indexing with metadata...")
-    try:
-        results = enhanced_webpage_indexing_with_metadata(test_url, False)
-        print(f"   ✅ Extracted {len(results)} enhanced chunks")
+        for modality in MODALITIES:
+            count = get_collection_count(modality)
+            status_data[modality] = count
+            logger.info(f"Status: {modality} has {count} items")
         
-        if results:
-            print("\n   📊 Enhanced Chunk Details:")
-            for i, (emb, meta) in enumerate(results):
-                print(f"   Chunk {i+1}:")
-                print(f"     - Type: {meta.get('content_type', 'unknown')}")
-                print(f"     - Weight: {meta.get('weight', 1.0)}")
-                print(f"     - Section: {meta.get('section', 'unknown')}")
-                print(f"     - Title: {meta.get('title', 'N/A')}")
-                print(f"     - Description: {meta.get('description', 'N/A')[:100]}...")
-                print(f"     - WebLoader Title: {meta.get('web_loader_title', 'N/A')}")
-                print(f"     - WebLoader Description: {meta.get('web_loader_description', 'N/A')[:100]}...")
-                print(f"     - Author: {meta.get('author', 'N/A')}")
-                print(f"     - Language: {meta.get('language', 'N/A')}")
-                print(f"     - Text Length: {meta.get('text_length', 0)}")
-                print(f"     - Word Count: {meta.get('word_count', 0)}")
-                print(f"     - Has Title: {meta.get('has_title', False)}")
-                print(f"     - Has Description: {meta.get('has_description', False)}")
-                print(f"     - Embedding shape: {emb.shape}")
-                print()
-        else:
-            print("   ❌ No chunks extracted")
+        # Add ARNS count
+        arns_count = get_collection_count("arns")
+        status_data["arns"] = arns_count
+        logger.info(f"Status: ARNS has {arns_count} items")
+        
+        # Add total count
+        total_count = sum(status_data.values())
+        status_data["total"] = total_count
+        logger.info(f"Status: Total items indexed: {total_count}")
             
     except Exception as e:
-        print(f"   ❌ Enhanced webpage indexing failed: {e}")
-        return
+        logger.error(f"Error getting status: {e}")
+        status_data = {m: 0 for m in MODALITIES}
+        status_data["arns"] = 0
+        status_data["total"] = 0
     
-    # Test 4: Test enhanced search with metadata
-    print("\n4. Testing enhanced search with metadata...")
-    try:
-        # Test search with a relevant query
-        test_query = "arlink"
-        search_results = enhanced_search_modality(test_query, 5, "web")
-        print(f"   ✅ Search returned {len(search_results.get('results', []))} results")
-        
-        if search_results.get('results'):
-            print("\n   🔍 Top Search Results:")
-            for i, result in enumerate(search_results['results'][:3]):
-                print(f"   Result {i+1}:")
-                print(f"     - Score: {result.get('score', 0):.4f}")
-                print(f"     - Type: {result.get('content_type', 'unknown')}")
-                print(f"     - URL: {result.get('url', 'unknown')}")
-                print(f"     - Title: {result.get('title', 'N/A')}")
-                print(f"     - Description: {result.get('description', 'N/A')[:100]}...")
-                print(f"     - WebLoader Title: {result.get('web_loader_title', 'N/A')}")
-                print(f"     - WebLoader Description: {result.get('web_loader_description', 'N/A')[:100]}...")
-                print(f"     - Author: {result.get('author', 'N/A')}")
-                print(f"     - Language: {result.get('language', 'N/A')}")
-                print()
-        else:
-            print("   ❌ No search results found")
-            
-    except Exception as e:
-        print(f"   ❌ Enhanced search failed: {e}")
-        return
-    
-    print("=" * 60)
-    print("✅ All tests completed successfully!")
-    print("🎉 Enhanced webpage indexing with metadata is working correctly!")
+    return status_data
 
-def test_content_extraction():
-    """
-    Test content extraction specifically for arlink.arweave.net
-    """
-    test_url = "https://arlink.arweave.net"
+@app.get("/debug/collections")
+def debug_collections():
+    """Debug endpoint to check ChromaDB collection status"""
+    debug_info = {}
     
-    print(f"🔍 Testing content extraction for: {test_url}")
-    print("=" * 50)
-    
-    try:
-        # Test direct fetch
-        print("1. Testing direct fetch...")
-        resp = requests.get(test_url, timeout=10, headers={
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-        })
-        html_content = resp.text
-        print(f"   ✅ Fetched {len(html_content)} characters")
-        
-        # Test BeautifulSoup parsing
-        print("\n2. Testing HTML parsing...")
-        soup = BeautifulSoup(html_content, "html.parser")
-        title = soup.title.string if soup.title else "No title found"
-        print(f"   ✅ Title: {title}")
-        
-        # Test enhanced metadata extraction
-        print("\n3. Testing enhanced metadata extraction...")
-        enhanced_metadata = extract_enhanced_metadata(soup, test_url)
-        print(f"   ✅ Enhanced metadata extracted:")
-        for key, value in enhanced_metadata.items():
-            if value:
-                print(f"     - {key}: {str(value)[:100]}...")
-        
-        # Test content extraction with metadata
-        print("\n4. Testing content extraction with metadata...")
-        chunks, extracted_title, meta_desc = extract_and_weight_content(soup, test_url)
-        print(f"   ✅ Extracted {len(chunks)} chunks")
-        print(f"   ✅ Title: {extracted_title}")
-        print(f"   ✅ Meta description: {meta_desc[:100]}...")
-        
-        # Show chunk details with metadata
-        print("\n5. Enhanced Chunk Analysis:")
-        for i, chunk in enumerate(chunks):
-            print(f"   Chunk {i+1}:")
-            print(f"     - Type: {chunk['type']}")
-            print(f"     - Weight: {chunk['weight']}")
-            print(f"     - Section: {chunk['section']}")
-            print(f"     - Text length: {len(chunk['text'])}")
-            print(f"     - Preview: {chunk['text'][:80]}...")
-            print()
-        
-        # Test embedding creation with metadata
-        print("6. Testing embedding creation with metadata...")
-        weighted_results = create_weighted_embeddings(chunks, test_url, False)
-        print(f"   ✅ Created {len(weighted_results)} embeddings")
-        
-        for i, (emb, meta) in enumerate(weighted_results):
-            print(f"   Embedding {i+1}:")
-            print(f"     - Shape: {emb.shape}")
-            print(f"     - Type: {meta.get('content_type')}")
-            print(f"     - Weight: {meta.get('weight')}")
-            print(f"     - Title: {meta.get('title', 'N/A')}")
-            print(f"     - WebLoader Title: {meta.get('web_loader_title', 'N/A')}")
-            print(f"     - Author: {meta.get('author', 'N/A')}")
-            print(f"     - Language: {meta.get('language', 'N/A')}")
-            print()
-        
-    except Exception as e:
-        print(f"   ❌ Content extraction test failed: {e}")
-        import traceback
-        traceback.print_exc()
-
-def test_metadata_search():
-    """
-    Test metadata-based search functionality
-    """
-    test_url = "https://arlink.arweave.net"
-    
-    print(f"🔍 Testing metadata search for: {test_url}")
-    print("=" * 50)
-    
-    try:
-        # First, index the content
-        print("1. Indexing content for testing...")
-        results = enhanced_webpage_indexing_with_metadata(test_url, False)
-        if results:
-            for emb, meta in results:
-                store(emb, meta, "web")
-            print(f"   ✅ Indexed {len(results)} chunks")
-        
-        # Test metadata search
-        print("\n2. Testing metadata search...")
-        test_queries = [
-            "arlink",
-            "arweave",
-            "decentralized"
-        ]
-        
-        for query in test_queries:
-            print(f"\n   🔍 Testing query: '{query}'")
-            search_results = search_with_metadata_filters(query, 3, "web")
-            
-            if search_results.get('results'):
-                print(f"     ✅ Found {len(search_results['results'])} results")
-                for i, result in enumerate(search_results['results'][:2]):
-                    print(f"     Result {i+1}:")
-                    print(f"       - Score: {result.get('score', 0):.4f}")
-                    print(f"       - URL: {result.get('url', 'N/A')}")
-                    print(f"       - Title: {result.get('title', 'N/A')}")
-                    print(f"       - Type: {result.get('content_type', 'N/A')}")
-                    print(f"       - Author: {result.get('author', 'N/A')}")
-                    print(f"       - Language: {result.get('language', 'N/A')}")
-            else:
-                print(f"     ❌ No results for '{query}'")
-        
-    except Exception as e:
-        print(f"   ❌ Metadata search test failed: {e}")
-        import traceback
-        traceback.print_exc()
-
-def test_webloader_refactoring():
-    """
-    Test the WebBaseLoader refactoring functionality
-    """
-    test_urls = [
-        "https://arlink.arweave.net",  # Should work with WebBaseLoader
-        "https://test-non-assigned.arweave.net"  # Mock for testing
-    ]
-    
-    print("🧪 Testing WebBaseLoader Refactoring")
-    print("=" * 50)
-    
-    for test_url in test_urls:
-        print(f"\n🔍 Testing URL: {test_url}")
-        
+    for modality in MODALITIES:
         try:
-            # Test webpage detection
-            is_webpage = check_webpage(test_url)
-            print(f"   ✅ Is webpage: {is_webpage}")
-            
-            if not is_webpage:
-                print("   ⚠️  Not a valid webpage, skipping")
-                continue
-            
-            # Test content extraction with WebBaseLoader
-            results = enhanced_webpage_indexing_with_metadata(test_url, True)  # is_arns=True
-            
-            if results:
-                print(f"   ✅ Extracted {len(results)} chunks")
-                
-                # Analyze processing method and metadata
-                web_loader_count = 0
-                beautifulsoup_count = 0
-                
-                for i, (emb, meta) in enumerate(results):
-                    processing_method = meta.get("processing_method", "unknown")
-                    web_loader_title = meta.get("web_loader_title", "")
-                    web_loader_description = meta.get("web_loader_description", "")
-                    web_loader_content = meta.get("web_loader_content", "")
-                    
-                    print(f"\n   Chunk {i+1}:")
-                    print(f"     - Processing Method: {processing_method}")
-                    print(f"     - WebBaseLoader Title: {web_loader_title[:50]}...")
-                    print(f"     - WebBaseLoader Description: {web_loader_description[:50]}...")
-                    print(f"     - WebBaseLoader Content Length: {len(web_loader_content)} chars")
-                    print(f"     - ARNS Status: {meta.get('arns_status', 'N/A')}")
-                    print(f"     - Is Non-Assigned: {meta.get('is_non_assigned_arns', False)}")
-                    
-                    if processing_method == "web_loader_primary":
-                        web_loader_count += 1
-                        print(f"     - ✅ WebBaseLoader Primary Method")
-                    else:
-                        beautifulsoup_count += 1
-                        print(f"     - 🔄 BeautifulSoup Fallback")
-                
-                print(f"\n   📊 Processing Summary:")
-                print(f"     - WebBaseLoader Primary: {web_loader_count}")
-                print(f"     - BeautifulSoup Fallback: {beautifulsoup_count}")
-                print(f"     - Total Chunks: {len(results)}")
-                
-                # Test search with processing method filtering
-                print(f"\n   🔍 Testing search with processing method...")
-                search_results = search_with_metadata_filters("arlink", 5, "web")
-                
-                if search_results.get('results'):
-                    print(f"     ✅ Found {len(search_results['results'])} search results")
-                    
-                    # Check processing methods in search results
-                    web_loader_results = 0
-                    for result in search_results['results']:
-                        if result.get('processing_method') == 'web_loader_primary':
-                            web_loader_results += 1
-                    
-                    print(f"     - WebBaseLoader processed results: {web_loader_results}")
-                    print(f"     - BeautifulSoup fallback results: {len(search_results['results']) - web_loader_results}")
-                else:
-                    print(f"     ⚠️  No search results found")
-                    
-            else:
-                print("   ❌ No chunks extracted")
-                
+            count = get_collection_count(modality)
+            debug_info[modality] = {
+                "exists": collections[modality] is not None,
+                "count": count,
+                "collection_name": f"arweave_{modality}"
+            }
         except Exception as e:
-            print(f"   ❌ WebBaseLoader refactoring test failed: {e}")
-            import traceback
-            traceback.print_exc()
-
-# Add test endpoints to FastAPI
-@app.get("/test/arlink")
-def test_arlink_endpoint():
-    """Test endpoint for arlink.arweave.net"""
-    test_webpage_indexing()
-    return {"message": "Arlink test completed, check logs for details"}
-
-@app.get("/test/arlink/extraction")
-def test_arlink_extraction_endpoint():
-    """Test content extraction for arlink.arweave.net"""
-    test_content_extraction()
-    return {"message": "Arlink extraction test completed, check logs for details"}
-
-@app.get("/test/metadata-search")
-def test_metadata_search_endpoint():
-    """Test metadata search functionality"""
-    test_metadata_search()
-    return {"message": "Metadata search test completed, check logs for details"}
-
-@app.get("/test/webloader-refactoring")
-def test_webloader_refactoring_endpoint():
-    """Test WebBaseLoader refactoring functionality"""
-    test_webloader_refactoring()
-    return {"message": "WebBaseLoader refactoring test completed, check logs for details"}
-
-def search_with_metadata_filters(query: str, top_k: int = TOP_K, modality: str = "web", 
-                                filters: dict = None, where: dict = None):
-    """
-    Search with metadata filtering capabilities.
+            debug_info[modality] = {
+                "exists": False,
+                "error": str(e)
+            }
     
-    Args:
-        query: Search query
-        top_k: Number of results to return
-        modality: Content modality to search
-        filters: Dictionary of metadata filters (e.g., {"author": "John", "language": "en"})
-        where: ChromaDB where clause for filtering
-    """
-    logger.info(f"Metadata-filtered search called for modality '{modality}' with query '{query}' and filters: {filters}")
-    
+    # Check ARNS
     try:
-        # Get the appropriate collection
-        collection = collections.get(modality)
-        if not collection:
-            logger.warning(f"No ChromaDB collection for modality '{modality}'")
-            return {"results": []}
-        
-        # Create query embedding
-        query_embedding = embed_text(query)
-        
-        # Prepare where clause for filtering
-        where_clause = where or {}
-        
-        # Add filters to where clause
-        if filters:
-            for key, value in filters.items():
-                if value:
-                    where_clause[key] = value
-        
-        # Search in ChromaDB with filters
-        results = collection.query(
-            query_embeddings=[query_embedding.tolist()],
-            n_results=top_k * 3,
-            where=where_clause if where_clause else None,
-            include=["metadatas", "documents", "distances"]
-        )
-        
-        if not results['ids'] or not results['ids'][0]:
-            logger.warning(f"No results found for modality '{modality}' with filters")
-            return {"results": []}
-        
-        # Process results
-        raw_results = []
-        for i, (id_val, metadata, document, distance) in enumerate(zip(
-            results['ids'][0], 
-            results['metadatas'][0], 
-            results['documents'][0], 
-            results['distances'][0]
-        )):
-            if metadata and document:
-                # Convert distance to similarity score
-                score = 1.0 - (distance / 2.0)
-                
-                # Apply content type weighting for web results
-                adjusted_score = score
-                if modality == "web" and metadata.get("content_type") == "title":
-                    adjusted_score *= 1.5
-                elif modality == "web" and metadata.get("content_type") == "description":
-                    adjusted_score *= 1.2
-                
-                raw_results.append({
-                    "score": adjusted_score,
-                    "original_score": score,
-                    **metadata,
-                    "chunk": document
-                })
-        
-        # Group results
-        SCORE_GROUP_THRESHOLD = 0.01
-        grouped = []
-        used = [False] * len(raw_results)
-        
-        for i, res in enumerate(raw_results):
-            if used[i]:
-                continue
-            group = [res]
-            used[i] = True
-            
-            for j in range(i + 1, len(raw_results)):
-                if used[j]:
-                    continue
-                if abs(res['original_score'] - raw_results[j]['original_score']) < SCORE_GROUP_THRESHOLD:
-                    group.append(raw_results[j])
-                    used[j] = True
-            
-            group.sort(key=lambda x: -x['score'])
-            main = group[0]
-            duplicates = group[1:]
-            main['duplicates'] = duplicates
-            main['has_duplicates'] = len(duplicates) > 0
-            grouped.append(main)
-        
-        grouped.sort(key=lambda x: -x['score'])
-        grouped = grouped[:top_k]
-        
-        logger.info(f"Metadata-filtered search returned {len(grouped)} results")
-        return {"results": grouped}
-        
+        arns_count = get_collection_count("arns")
+        debug_info["arns"] = {
+            "exists": collections["arns"] is not None,
+            "count": arns_count,
+            "collection_name": "arweave_arns"
+        }
     except Exception as e:
-        logger.error(f"Error in metadata-filtered search: {e}")
+        debug_info["arns"] = {
+            "exists": False,
+            "error": str(e)
+        }
+    
+    return debug_info
+
+def search_modality(query: str, top_k: int, modality: str):
+    logger.info(f"Search called for modality '{modality}' with query '{query}' and top_k={top_k}")
+    
+    # Create query embedding
+    query_embedding = embed_text(query)
+    
+    # Search in ChromaDB
+    results = search_in_chromadb(query_embedding, modality, top_k)
+    
+    # Group results by score (within threshold)
+    SCORE_GROUP_THRESHOLD = 0.01
+    raw_results = results.get("results", [])
+    
+    if not raw_results:
+        logger.warning(f"No search results for modality '{modality}'")
+        return {"results": []}
+    
+    grouped = []
+    used = [False] * len(raw_results)
+    for i, res in enumerate(raw_results):
+        if used[i]:
+            continue
+        group = [res]
+        used[i] = True
+        for j in range(i + 1, len(raw_results)):
+            if used[j]:
+                continue
+            if abs(res['score'] - raw_results[j]['score']) < SCORE_GROUP_THRESHOLD:
+                group.append(raw_results[j])
+                used[j] = True
+        # Sort group by score descending
+        group.sort(key=lambda x: -x['score'])
+        main = group[0]
+        duplicates = group[1:]
+        main['duplicates'] = duplicates
+        main['has_duplicates'] = len(duplicates) > 0
+        grouped.append(main)
+    # Sort groups by main score descending and take top_k groups only
+    grouped.sort(key=lambda x: -x['score'])
+    grouped = grouped[:top_k]
+    logger.info(f"Search for modality '{modality}' returned {len(grouped)} grouped results (top_k={top_k}).")
+    return {"results": grouped}
+
+# Update ARNS search endpoint to use ARNS-exclusive index/meta
+@app.get("/searchweb")
+def search_web(query: str, top_k: int = TOP_K):
+    """Search web content using ChromaDB"""
+    try:
+        results = enhanced_search_modality(query, top_k, "web")
+        # Unpack if nested
+        if isinstance(results, dict) and "results" in results:
+            return {"results": results["results"]}
+        return {"results": results}
+    except Exception as e:
+        logger.error(f"Web search error: {e}")
         return {"results": []}
 
-# Add metadata search endpoint
-@app.get("/searchweb/metadata")
-def search_web_with_metadata(
-    query: str, 
-    top_k: int = TOP_K,
-    author: str = None,
-    language: str = None,
-    content_type: str = None,
-    domain: str = None,
-    has_title: bool = None,
-    has_description: bool = None
-):
-    """Search web content with metadata filtering."""
-    filters = {}
-    if author:
-        filters["author"] = author
-    if language:
-        filters["language"] = language
-    if content_type:
-        filters["content_type"] = content_type
-    if domain:
-        filters["domain"] = domain
-    if has_title is not None:
-        filters["has_title"] = has_title
-    if has_description is not None:
-        filters["has_description"] = has_description
-    
-    return search_with_metadata_filters(query, top_k, "web", filters)
+@app.get("/searchimage")
+def search_image(query: str, top_k: int = TOP_K):
+    """Search image content using ChromaDB"""
+    try:
+        results = retrieve_image(query, top_k)
+        if isinstance(results, dict) and "results" in results:
+            return {"results": results["results"]}
+        return {"results": results}
+    except Exception as e:
+        logger.error(f"Image search error: {e}")
+        return {"results": []}
 
+@app.get("/searchaudio")
+def search_audio(query: str, top_k: int = TOP_K):
+    """Search audio content using ChromaDB"""
+    try:
+        results = retrieve_audio(query, top_k)
+        if isinstance(results, dict) and "results" in results:
+            return {"results": results["results"]}
+        return {"results": results}
+    except Exception as e:
+        logger.error(f"Audio search error: {e}")
+        return {"results": []}
+
+@app.get("/searchvideo")
+def search_video(query: str, top_k: int = TOP_K):
+    """Search video content using ChromaDB"""
+    try:
+        results = retrieve_video(query, top_k)
+        if isinstance(results, dict) and "results" in results:
+            return {"results": results["results"]}
+        return {"results": results}
+    except Exception as e:
+        logger.error(f"Video search error: {e}")
+        return {"results": []} 
+
+def flatten_result(res):
+    # Move all metadata fields to the top level
+    meta = res.get('metadata', {})
+    flat = {k: v for k, v in meta.items()}
+    flat['score'] = res.get('score', 0.0)
+    # Use 'document' as 'chunk' if not present
+    if 'chunk' not in flat and 'document' in res:
+        flat['chunk'] = res['document']
+    # Remove unwanted keys
+    for k in ['id', 'metadata', 'document']:
+        if k in flat:
+            del flat[k]
+    # Recursively flatten duplicates
+    if 'duplicates' in res:
+        flat['duplicates'] = [flatten_result(d) for d in res['duplicates']]
+    else:
+        flat['duplicates'] = []
+    flat['has_duplicates'] = bool(flat['duplicates'])
+    return flat
+
+def group_results(raw_results, top_k, score_group_threshold=0.01):
+    # Convert raw distance to similarity score: score = 1 - distance
+    for res in raw_results:
+        if 'score' in res:
+            res['score'] = 1.0 - res['score']
+    grouped = []
+    used = [False] * len(raw_results)
+    for i, res in enumerate(raw_results):
+        if used[i]:
+            continue
+        group = [res]
+        used[i] = True
+        for j in range(i + 1, len(raw_results)):
+            if used[j]:
+                continue
+            if abs(res['score'] - raw_results[j]['score']) < score_group_threshold:
+                group.append(raw_results[j])
+                used[j] = True
+        group.sort(key=lambda x: -x['score'])  # Higher similarity = better
+        main = group[0]
+        duplicates = group[1:]
+        main['duplicates'] = duplicates
+        main['has_duplicates'] = len(duplicates) > 0
+        grouped.append(main)
+    grouped.sort(key=lambda x: -x['score'])
+    # Flatten all results for frontend compatibility
+    return [flatten_result(g) for g in grouped[:top_k]]
+
+# === Retrieval Functions ===
+def retrieve_web(prompt, top_k=100):
+    """Retrieve web content using ChromaDB, grouped for frontend compatibility"""
+    try:
+        query_embedding = embed_text(prompt)
+        results = search_in_chromadb(query_embedding, "web", top_k * 3)
+        raw_results = results.get("results", [])
+        grouped = group_results(raw_results, top_k)
+        return {"results": grouped}
+    except Exception as e:
+        logger.error(f"Error in retrieve_web: {e}")
+        return {"results": []}
+
+def retrieve_image(prompt, top_k=100):
+    """Retrieve image content using ChromaDB, grouped for frontend compatibility"""
+    try:
+        query_embedding = embed_text(prompt)
+        results = search_in_chromadb(query_embedding, "image", top_k * 3)
+        raw_results = results.get("results", [])
+        grouped = group_results(raw_results, top_k)
+        return {"results": grouped}
+    except Exception as e:
+        logger.error(f"Error in retrieve_image: {e}")
+        return {"results": []}
+
+def retrieve_audio(prompt, top_k=100):
+    """Retrieve audio content using ChromaDB, grouped for frontend compatibility"""
+    try:
+        query_embedding = embed_text(prompt)
+        results = search_in_chromadb(query_embedding, "audio", top_k * 3)
+        raw_results = results.get("results", [])
+        grouped = group_results(raw_results, top_k)
+        return {"results": grouped}
+    except Exception as e:
+        logger.error(f"Error in retrieve_audio: {e}")
+        return {"results": []}
+
+def retrieve_video(prompt, top_k=100):
+    """Retrieve video content using ChromaDB, grouped for frontend compatibility"""
+    try:
+        query_embedding = embed_text(prompt)
+        results = search_in_chromadb(query_embedding, "video", top_k * 3)
+        raw_results = results.get("results", [])
+        grouped = group_results(raw_results, top_k)
+        return {"results": grouped}
+    except Exception as e:
+        logger.error(f"Error in retrieve_video: {e}")
+        return {"results": []} 

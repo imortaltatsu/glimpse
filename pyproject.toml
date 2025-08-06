@@ -4,4 +4,22 @@ version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.10"
-dependencies = []
+dependencies = [
+    "chromadb>=0.4.0",
+    "fastapi",
+    "uvicorn",
+    "requests",
+    "numpy",
+    "torch",
+    "torchaudio",
+    "Pillow",
+    "beautifulsoup4",
+    "langchain",
+    "langchain-community",
+    "cuml-cu12",
+    "imagebind",
+    "librosa",
+    "soundfile",
+    "av",
+    "pydantic"
+]
