@@ -1,0 +1,50 @@
+# Core FastAPI dependencies
+fastapi==0.104.1
+uvicorn==0.24.0
+pydantic==2.5.0
+
+# PyTorch ecosystem (compatible with ImageBind)
+torch==2.1.0+cu121
+torchvision==0.16.0+cu121
+torchaudio==2.1.0+cu121
+
+# ImageBind and multimodal processing
+imagebind
+pytorchvideo @ git+https://github.com/facebookresearch/pytorchvideo.git@28fe037d212663c6a24f373b94cc5d478c8c1a1d
+timm
+ftfy
+regex
+einops
+fvcore
+eva-decord
+iopath
+
+# Audio processing
+librosa==0.11.0
+soundfile==0.13.1
+av
+
+# Computer vision and image processing
+Pillow==10.2.0
+opencv-python
+
+# Vector database and embeddings
+chromadb==0.4.18
+sentence-transformers==2.2.2
+
+# LangChain (compatible versions)
+langchain
+langchain-community
+transformers==4.29.2
+tokenizers==0.13.3
+
+# Web scraping and parsing
+beautifulsoup4==4.12.3
+requests==2.31.0
+aiofiles==23.2.1
+python-multipart==0.0.6
+
+# Utilities
+numpy==1.24.3
+matplotlib
+python-dateutil
