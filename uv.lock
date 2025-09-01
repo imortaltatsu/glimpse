@@ -529,6 +529,18 @@ wheels = [
 ]
 
 [[package]]
+name = "fake-useragent"
+version = "2.2.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "importlib-resources", marker = "python_full_version < '3.10'" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/41/43/948d10bf42735709edb5ae51e23297d034086f17fc7279fef385a7acb473/fake_useragent-2.2.0.tar.gz", hash = "sha256:4e6ab6571e40cc086d788523cf9e018f618d07f9050f822ff409a4dfe17c16b2", size = 158898, upload-time = "2025-04-14T15:32:19.238Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/51/37/b3ea9cd5558ff4cb51957caca2193981c6b0ff30bd0d2630ac62505d99d0/fake_useragent-2.2.0-py3-none-any.whl", hash = "sha256:67f35ca4d847b0d298187443aaf020413746e56acd985a611908c73dba2daa24", size = 161695, upload-time = "2025-04-14T15:32:17.732Z" },
+]
+
+[[package]]
 name = "fastapi"
 version = "0.104.1"
 source = { registry = "https://pypi.org/simple" }
@@ -701,6 +713,7 @@ dependencies = [
     { name = "einops" },
     { name = "eva-decord" },
     { name = "exceptiongroup" },
+    { name = "fake-useragent" },
     { name = "fastapi" },
     { name = "filelock" },
     { name = "flatbuffers" },
@@ -769,6 +782,7 @@ dependencies = [
     { name = "nvidia-nvtx-cu12" },
     { name = "oauthlib" },
     { name = "onnxruntime" },
+    { name = "opencv-python" },
     { name = "opentelemetry-api" },
     { name = "opentelemetry-exporter-otlp-proto-common" },
     { name = "opentelemetry-exporter-otlp-proto-grpc" },
@@ -884,6 +898,7 @@ requires-dist = [
     { name = "einops", specifier = "==0.8.1" },
     { name = "eva-decord", specifier = "==0.6.1" },
     { name = "exceptiongroup", specifier = "==1.3.0" },
+    { name = "fake-useragent", specifier = "==2.2.0" },
     { name = "fastapi", specifier = "==0.104.1" },
     { name = "filelock", specifier = "==3.19.1" },
     { name = "flatbuffers", specifier = "==25.2.10" },
@@ -912,7 +927,6 @@ requires-dist = [
     { name = "jsonpointer", specifier = "==3.0.0" },
     { name = "kiwisolver", specifier = "==1.4.7" },
     { name = "kubernetes", specifier = "==33.1.0" },
-    { name = "langchain" },
     { name = "langchain", specifier = "==0.0.347" },
     { name = "langchain-core", specifier = "==0.0.11" },
     { name = "langsmith", specifier = "==0.0.92" },
@@ -953,6 +967,7 @@ requires-dist = [
     { name = "nvidia-nvtx-cu12", specifier = "==12.8.90" },
     { name = "oauthlib", specifier = "==3.3.1" },
     { name = "onnxruntime", specifier = "==1.18.1" },
+    { name = "opencv-python" },
     { name = "opentelemetry-api", specifier = "==1.36.0" },
     { name = "opentelemetry-exporter-otlp-proto-common", specifier = "==1.36.0" },
     { name = "opentelemetry-exporter-otlp-proto-grpc", specifier = "==1.36.0" },
@@ -1010,13 +1025,10 @@ requires-dist = [
     { name = "tenacity", specifier = "==8.5.0" },
     { name = "termcolor", specifier = "==3.1.0" },
     { name = "threadpoolctl", specifier = "==3.6.0" },
-    { name = "timm" },
     { name = "timm", specifier = "==1.0.19" },
     { name = "tokenizers", specifier = "==0.13.3" },
     { name = "torch", specifier = "==1.13.1" },
-    { name = "torchaudio" },
     { name = "torchaudio", specifier = "==0.13.1" },
-    { name = "torchvision" },
     { name = "torchvision", specifier = "==0.14.1" },
     { name = "tqdm", specifier = "==4.67.1" },
     { name = "transformers", specifier = "==4.29.2" },
@@ -2020,6 +2032,23 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/10/f5/67bd1b947bc4055ea62efd4b974cef51a8a6819ac4e8c61ca014901dbfd0/onnxruntime-1.18.1-cp39-cp39-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:ad3187c1faff3ac15f7f0e7373ef4788c582cafa655a80fdbb33eaec88976c66", size = 6793994, upload-time = "2024-06-27T23:53:42.554Z" },
     { url = "https://files.pythonhosted.org/packages/50/ea/4fb07d2a82d6b2782c98adcaea7d3e6b057b8e85c219f8d21e5ec72bc423/onnxruntime-1.18.1-cp39-cp39-win32.whl", hash = "sha256:34657c78aa4e0b5145f9188b550ded3af626651b15017bf43d280d7e23dbf195", size = 5070149, upload-time = "2024-06-27T23:53:44.734Z" },
     { url = "https://files.pythonhosted.org/packages/da/5b/60dd8b3acf1230eb7093122f4fa621784ec4a7deaaf246456a4e2f0f0a25/onnxruntime-1.18.1-cp39-cp39-win_amd64.whl", hash = "sha256:9c14fd97c3ddfa97da5feef595e2c73f14c2d0ec1d4ecbea99c8d96603c89589", size = 5584248, upload-time = "2024-06-27T23:53:47.307Z" },
+]
+
+[[package]]
+name = "opencv-python"
+version = "4.11.0.86"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "numpy" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/17/06/68c27a523103dad5837dc5b87e71285280c4f098c60e4fe8a8db6486ab09/opencv-python-4.11.0.86.tar.gz", hash = "sha256:03d60ccae62304860d232272e4a4fda93c39d595780cb40b161b310244b736a4", size = 95171956, upload-time = "2025-01-16T13:52:24.737Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/05/4d/53b30a2a3ac1f75f65a59eb29cf2ee7207ce64867db47036ad61743d5a23/opencv_python-4.11.0.86-cp37-abi3-macosx_13_0_arm64.whl", hash = "sha256:432f67c223f1dc2824f5e73cdfcd9db0efc8710647d4e813012195dc9122a52a", size = 37326322, upload-time = "2025-01-16T13:52:25.887Z" },
+    { url = "https://files.pythonhosted.org/packages/3b/84/0a67490741867eacdfa37bc18df96e08a9d579583b419010d7f3da8ff503/opencv_python-4.11.0.86-cp37-abi3-macosx_13_0_x86_64.whl", hash = "sha256:9d05ef13d23fe97f575153558653e2d6e87103995d54e6a35db3f282fe1f9c66", size = 56723197, upload-time = "2025-01-16T13:55:21.222Z" },
+    { url = "https://files.pythonhosted.org/packages/f3/bd/29c126788da65c1fb2b5fb621b7fed0ed5f9122aa22a0868c5e2c15c6d23/opencv_python-4.11.0.86-cp37-abi3-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:1b92ae2c8852208817e6776ba1ea0d6b1e0a1b5431e971a2a0ddd2a8cc398202", size = 42230439, upload-time = "2025-01-16T13:51:35.822Z" },
+    { url = "https://files.pythonhosted.org/packages/2c/8b/90eb44a40476fa0e71e05a0283947cfd74a5d36121a11d926ad6f3193cc4/opencv_python-4.11.0.86-cp37-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:6b02611523803495003bd87362db3e1d2a0454a6a63025dc6658a9830570aa0d", size = 62986597, upload-time = "2025-01-16T13:52:08.836Z" },
+    { url = "https://files.pythonhosted.org/packages/fb/d7/1d5941a9dde095468b288d989ff6539dd69cd429dbf1b9e839013d21b6f0/opencv_python-4.11.0.86-cp37-abi3-win32.whl", hash = "sha256:810549cb2a4aedaa84ad9a1c92fbfdfc14090e2749cedf2c1589ad8359aa169b", size = 29384337, upload-time = "2025-01-16T13:52:13.549Z" },
+    { url = "https://files.pythonhosted.org/packages/a4/7d/f1c30a92854540bf789e9cd5dde7ef49bbe63f855b85a2e6b3db8135c591/opencv_python-4.11.0.86-cp37-abi3-win_amd64.whl", hash = "sha256:085ad9b77c18853ea66283e98affefe2de8cc4c1f43eda4c100cf9b2721142ec", size = 39488044, upload-time = "2025-01-16T13:52:21.928Z" },
 ]
 
 [[package]]

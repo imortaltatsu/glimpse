@@ -35,6 +35,7 @@ import uuid
 import re
 from urllib.parse import urlparse, urljoin
 from urllib.robotparser import RobotFileParser
+from contextlib import asynccontextmanager
 
 print("✅ All imports completed successfully")
 
@@ -56,6 +57,20 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 DATA_DIR = "index_data"
 os.makedirs(DATA_DIR, exist_ok=True)
 MODALITIES = ["web", "image", "audio", "video", "all"]
+
+# Check if ffmpeg is available for audio/video processing
+def check_ffmpeg():
+    try:
+        result = subprocess.run(['ffmpeg', '-version'], capture_output=True, timeout=5)
+        return result.returncode == 0
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return False
+
+FFMPEG_AVAILABLE = check_ffmpeg()
+if FFMPEG_AVAILABLE:
+    logger.info("✅ FFmpeg is available for audio/video processing")
+else:
+    logger.warning("⚠️ FFmpeg not available - some audio/video formats may not be supported")
 
 # ChromaDB Configuration
 CHROMA_PERSIST_DIR = os.path.join(DATA_DIR, "chroma_db")
@@ -402,45 +417,166 @@ def embed_text(text):
 
 def embed_image(url):
     try:
+        # First, try to get headers to validate content type
+        try:
+            headers = requests.head(url, timeout=10).headers
+            content_type = headers.get('content-type', '').lower()
+            if not content_type.startswith('image/'):
+                logger.warning(f"URL {url} has non-image content-type: {content_type}")
+        except Exception as e:
+            logger.warning(f"Could not check headers for {url}: {e}")
+        
         img_bytes = requests.get(url, timeout=30).content
+        
+        # Validate that we actually got image data
+        if len(img_bytes) < 100:  # Too small to be a valid image
+            logger.warning(f"Image file too small for {url}: {len(img_bytes)} bytes")
+            return None
+            
         temp_dir = os.path.join(DATA_DIR, "temp")
         os.makedirs(temp_dir, exist_ok=True)
+        
+        # Use a more descriptive filename with extension detection
         filename = url.split("/")[-1]
         if not filename or "." not in filename:
-            filename = f"{filename}.jpg"
+            # Try to detect format from magic bytes
+            if img_bytes.startswith(b'\xff\xd8\xff'):
+                filename = f"image_{uuid.uuid4().hex[:8]}.jpg"
+            elif img_bytes.startswith(b'\x89PNG'):
+                filename = f"image_{uuid.uuid4().hex[:8]}.png"
+            elif img_bytes.startswith(b'GIF87a') or img_bytes.startswith(b'GIF89a'):
+                filename = f"image_{uuid.uuid4().hex[:8]}.gif"
+            else:
+                filename = f"image_{uuid.uuid4().hex[:8]}.bin"
+        
         temp_path = os.path.join(temp_dir, filename)
+        
         with open(temp_path, 'wb') as f:
             f.write(img_bytes)
+        
         logger.info(f"load image from {temp_path}")
+        
         try:
+            # Validate the image file before processing
+            try:
+                with Image.open(temp_path) as img:
+                    # Force load to catch any corruption
+                    img.load()
+                    # Convert to RGB if necessary
+                    if img.mode != 'RGB':
+                        img = img.convert('RGB')
+                    # Save as a clean JPEG for processing
+                    clean_path = os.path.join(temp_dir, f"clean_{filename}")
+                    img.save(clean_path, 'JPEG', quality=95)
+                    temp_path = clean_path
+            except Exception as img_error:
+                logger.error(f"Image validation failed for {url}: {img_error}")
+                return None
+            
+            # Now try to embed the validated image
             inputs = {ModalityType.VISION: data.load_and_transform_vision_data([temp_path], device=DEVICE)}
             with torch.no_grad():
                 emb = model(inputs)[ModalityType.VISION]
                 emb /= emb.norm(dim=-1, keepdim=True)
             return emb[0].cpu().numpy()
         finally:
-            os.remove(temp_path)
+            # Clean up all temporary files
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+            # Also clean up the original temp file if it was different
+            original_temp = os.path.join(temp_dir, filename)
+            if os.path.exists(original_temp) and original_temp != temp_path:
+                os.remove(original_temp)
     except Exception as e:
         logger.error(f"[embed_image] Failed to embed image from {url}: {e}")
         return None
 
 def embed_audio(url):
     try:
+        # First, try to get headers to validate content type
+        try:
+            headers = requests.head(url, timeout=10).headers
+            content_type = headers.get('content-type', '').lower()
+            if not content_type.startswith('audio/'):
+                logger.warning(f"URL {url} has non-audio content-type: {content_type}")
+        except Exception as e:
+            logger.warning(f"Could not check headers for {url}: {e}")
+        
         audio_bytes = requests.get(url, timeout=30).content
+        
+        # Validate that we actually got audio data
+        if len(audio_bytes) < 100:  # Too small to be a valid audio file
+            logger.warning(f"Audio file too small for {url}: {len(audio_bytes)} bytes")
+            return None
+            
         temp_dir = os.path.join(DATA_DIR, "temp")
         os.makedirs(temp_dir, exist_ok=True)
+        
         unique_id = str(uuid.uuid4())
         temp_in_path = os.path.join(temp_dir, f"input_audio_{unique_id}")
         temp_wav_path = os.path.join(temp_dir, f"temp_{unique_id}.wav")
+        
         # Save the original audio bytes to a temp file
         with open(temp_in_path, 'wb') as f:
             f.write(audio_bytes)
+        
         try:
-            # Load and decode audio with librosa (handles most formats)
-            y, sr = librosa.load(temp_in_path, sr=None, mono=True)
+            # Try multiple audio loading approaches
+            y, sr = None, None
+            
+            # Approach 1: Try librosa first (handles most formats)
+            try:
+                y, sr = librosa.load(temp_in_path, sr=None, mono=True)
+                logger.info(f"Successfully loaded audio with librosa: {url}")
+            except Exception as librosa_error:
+                logger.warning(f"Librosa failed for {url}: {librosa_error}")
+                
+                # Approach 2: Try soundfile as fallback
+                try:
+                    y, sr = sf.read(temp_in_path)
+                    if len(y.shape) > 1:  # Convert stereo to mono
+                        y = np.mean(y, axis=1)
+                    logger.info(f"Successfully loaded audio with soundfile: {url}")
+                except Exception as sf_error:
+                    logger.warning(f"Soundfile failed for {url}: {sf_error}")
+                    
+                    # Approach 3: Try ffmpeg as last resort (only if available)
+                    if FFMPEG_AVAILABLE:
+                        try:
+                            ffmpeg_path = os.path.join(temp_dir, f"ffmpeg_{unique_id}.wav")
+                            result = subprocess.run([
+                                'ffmpeg', '-y', '-i', temp_in_path, 
+                                '-ac', '1', '-ar', '16000', '-f', 'wav', ffmpeg_path
+                            ], capture_output=True, timeout=30)
+                            
+                            if result.returncode == 0 and os.path.exists(ffmpeg_path):
+                                y, sr = librosa.load(ffmpeg_path, sr=16000, mono=True)
+                                logger.info(f"Successfully loaded audio with ffmpeg: {url}")
+                                # Clean up ffmpeg temp file
+                                os.remove(ffmpeg_path)
+                            else:
+                                logger.error(f"FFmpeg conversion failed for {url}: {result.stderr.decode()}")
+                                return None
+                        except Exception as ffmpeg_error:
+                            logger.error(f"FFmpeg approach failed for {url}: {ffmpeg_error}")
+                            return None
+                    else:
+                        logger.warning(f"FFmpeg not available, cannot try conversion for {url}")
+                        return None
+            
+            if y is None or sr is None:
+                logger.error(f"All audio loading approaches failed for {url}")
+                return None
+            
+            # Validate audio data
+            if len(y) < sr * 0.1:  # Less than 0.1 seconds
+                logger.warning(f"Audio file too short for {url}: {len(y)/sr:.2f} seconds")
+                return None
+            
             # Save as wav using soundfile
             sf.write(temp_wav_path, y, sr, format='WAV')
             logger.info(f"Audio converted and saved as WAV: {temp_wav_path}")
+            
             # Now use your embedding logic on temp_wav_path
             inputs = {ModalityType.AUDIO: data.load_and_transform_audio_data([temp_wav_path], device=DEVICE)}
             with torch.no_grad():
@@ -448,6 +584,7 @@ def embed_audio(url):
                 emb /= emb.norm(dim=-1, keepdim=True)
             return emb[0].cpu().numpy()
         finally:
+            # Clean up all temporary files
             if os.path.exists(temp_in_path):
                 os.remove(temp_in_path)
             if os.path.exists(temp_wav_path):
@@ -468,29 +605,88 @@ def ensure_tensor(data):
 
 def embed_video(url):
     try:
+        # First, try to get headers to validate content type
+        try:
+            headers = requests.head(url, timeout=10).headers
+            content_type = headers.get('content-type', '').lower()
+            if not content_type.startswith('video/'):
+                logger.warning(f"URL {url} has non-video content-type: {content_type}")
+        except Exception as e:
+            logger.warning(f"Could not check headers for {url}: {e}")
+        
         video_bytes = requests.get(url, timeout=30).content
+        
+        # Validate that we actually got video data
+        if len(video_bytes) < 1000:  # Too small to be a valid video file
+            logger.warning(f"Video file too small for {url}: {len(video_bytes)} bytes")
+            return None
+            
         temp_dir = os.path.join(DATA_DIR, "temp")
         os.makedirs(temp_dir, exist_ok=True)
+        
+        # Use a more descriptive filename with extension detection
         filename = url.split("/")[-1]
         if not filename or "." not in filename:
-            filename = f"{filename}.mp4"
+            # Try to detect format from magic bytes
+            if video_bytes.startswith(b'\x00\x00\x00\x18') or video_bytes.startswith(b'\x00\x00\x00\x20'):
+                filename = f"video_{uuid.uuid4().hex[:8]}.mp4"
+            elif video_bytes.startswith(b'RIFF') and b'AVI ' in video_bytes[8:12]:
+                filename = f"video_{uuid.uuid4().hex[:8]}.avi"
+            elif video_bytes.startswith(b'\x1A\x45\xDF\xA3'):
+                filename = f"video_{uuid.uuid4().hex[:8]}.mkv"
+            else:
+                filename = f"video_{uuid.uuid4().hex[:8]}.mp4"
+        
         temp_path = os.path.join(temp_dir, filename)
+        
         with open(temp_path, 'wb') as f:
             f.write(video_bytes)
+        
         logger.info(f"load video from {temp_path}")
+        
         try:
             vision_data = None
-            if filename.lower().endswith('.mov'):
-                mp4_path = temp_path.rsplit('.', 1)[0] + '.mp4'
-                try:
-                    subprocess.run(['ffmpeg', '-y', '-i', temp_path, mp4_path], check=True)
-                    vision_data = data.load_and_transform_video_data([mp4_path], device=DEVICE)
-                    os.remove(mp4_path)
-                except Exception as conv_e:
-                    logger.error(f"[embed_video] MOV to MP4 conversion failed for {url}: {conv_e}")
+            
+            # Use PyAV for video processing (more reliable than ImageBind's video loading)
+            try:
+                import av
+                container = av.open(temp_path)
+                stream = container.streams.video[0]
+                
+                # Extract frames for processing - limit to fewer frames to save memory
+                frames = []
+                frame_count = 0
+                for frame in container.decode(video=0):
+                    if frame_count < 4:  # Reduced from 8 to 4 frames to save memory
+                        # Resize frame to smaller dimensions to save memory
+                        frame_array = frame.to_ndarray(format='rgb24')
+                        if frame_array.shape[0] > 224 or frame_array.shape[1] > 224:
+                            # Resize to 224x224 to match ImageBind's expected input size
+                            import cv2
+                            frame_array = cv2.resize(frame_array, (224, 224))
+                        
+                        # Convert frame to tensor
+                        frame_tensor = torch.from_numpy(frame_array).float()
+                        frame_tensor = frame_tensor.permute(2, 0, 1)  # HWC to CHW
+                        frame_tensor = frame_tensor.unsqueeze(0)  # Add batch dimension
+                        frames.append(frame_tensor)
+                        frame_count += 1
+                    else:
+                        break
+                
+                if frames:
+                    # Stack frames and normalize
+                    vision_data = torch.cat(frames, dim=0)
+                    vision_data = vision_data / 255.0  # Normalize to 0-1
+                    logger.info(f"Successfully loaded video with PyAV: {url}")
+                else:
+                    logger.error(f"No frames extracted with PyAV for {url}")
                     return None
-            else:
-                vision_data = data.load_and_transform_video_data([temp_path], device=DEVICE)
+                    
+            except Exception as av_error:
+                logger.error(f"PyAV video processing failed for {url}: {av_error}")
+                return None
+            
             # Force tensor conversion for all cases
             if not torch.is_tensor(vision_data):
                 try:
@@ -498,16 +694,30 @@ def embed_video(url):
                 except Exception as e:
                     logger.error(f"[embed_video] Could not convert vision_data to tensor for {url}: {e}")
                     return None
-            logger.error(f"[embed_video] About to call model. vision_data type: {type(vision_data)}, is_tensor: {torch.is_tensor(vision_data)}, device: {getattr(vision_data, 'device', None)}")
+            
+            # Ensure tensor is on correct device
             if hasattr(vision_data, 'device') and vision_data.device != torch.device(DEVICE):
                 vision_data = vision_data.to(DEVICE)
+            
+            # Memory management: Clear cache before processing
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            
+            # Create inputs for the model
             inputs = {ModalityType.VISION: vision_data}
+            
             with torch.no_grad():
                 emb = model(inputs)[ModalityType.VISION]
+                
+            # Memory management: Clear cache after processing
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
                 emb /= emb.norm(dim=-1, keepdim=True)
             return emb[0].cpu().numpy()
         finally:
-            os.remove(temp_path)
+            # Clean up temporary files
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
     except Exception as e:
         logger.error(f"[embed_video] Failed to embed video from {url}: {e}")
         return None
@@ -1516,10 +1726,34 @@ def store(emb, meta, modality):
         logger.error(f"Error storing embedding for {modality}: {e}")
         return False
 
+# ==== Lifespan Events (Modern FastAPI approach) ====
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
+    print("🚀 Starting Multimodal Arweave Indexer...")
+    logger.info("App startup: launching background indexers.")
+    # arns_index_once()  # Run ARNS indexing once at startup
+    threading.Thread(target=lambda: index_modality_loop("image", ["image/png", "image/jpeg", "image/webp"]), daemon=True).start()
+    threading.Thread(target=lambda: index_modality_loop("audio", ["audio/mpeg", "audio/wav", "audio/mp3"]), daemon=True).start()
+    threading.Thread(target=lambda: index_modality_loop("video", ["video/mp4", "video/webm"]), daemon=True).start()
+    threading.Thread(target=lambda: index_modality_loop("web", ["application/x.arweave-manifest+json", "text/html"]), daemon=True).start()
+    threading.Thread(target=arns_index_loop, daemon=True).start()
+    
+    yield
+    
+    # Shutdown
+    logger.info("App shutdown: cleaning up resources.")
+    print("🛑 Shutting down Multimodal Arweave Indexer...")
+
 # ==== FastAPI ARNS flag endpoint ====
 ENABLE_ARNS = os.getenv("ENABLE_ARNS", "true").lower() == "true"
 
-app = FastAPI()
+app = FastAPI(
+    title="Multimodal Arweave Indexer",
+    description="A comprehensive multimodal content indexer for Arweave using ImageBind and ChromaDB",
+    version="2.0.0",
+    lifespan=lifespan
+)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 class SearchRequest(BaseModel):
@@ -1640,7 +1874,7 @@ def enhanced_search_modality(query: str, top_k: int, modality: str):
                     if query_lower in url_lower:
                         # Exact domain match gets maximum priority
                         adjusted_score *= 5.0  # Increased from 3.0 to 5.0
-                        logger.info(f"Exact domain match found: {query} in {url}")
+                        logger.info(f"Exact domain mtch found: {query} in {url}")
                     # Check for domain boost metadata
                     elif metadata.get("domain_boost"):
                         adjusted_score *= metadata.get("domain_boost", 1.0)
@@ -2504,16 +2738,7 @@ def index_modality_loop(modality, content_types):
             logger.error(f"[{modality.capitalize()} Indexer Error] {e}")
             time.sleep(30)
 
-@app.on_event("startup")
-def startup():
-    print("🚀 Starting Multimodal Arweave Indexer...")
-    logger.info("App startup: launching background indexers.")
-   # arns_index_once()  # Run ARNS indexing once at startup
-    #threading.Thread(target=lambda: index_modality_loop("image", ["image/png", "image/jpeg", "image/webp"]), daemon=True).start()
-    #threading.Thread(target=lambda: index_modality_loop("audio", ["audio/mpeg", "audio/wav", "audio/mp3"]), daemon=True).start()
-    #threading.Thread(target=lambda: index_modality_loop("video", ["video/mp4", "video/webm"]), daemon=True).start()
-    threading.Thread(target=lambda: index_modality_loop("web", ["application/x.arweave-manifest+json", "text/html"]), daemon=True).start()
-    threading.Thread(target=arns_index_loop, daemon=True).start()
+
 
 # ==== Test Functions ====
 def test_webpage_indexing():
@@ -2974,4 +3199,6 @@ def search_web_with_metadata(
         filters["has_description"] = has_description
     
     return search_with_metadata_filters(query, top_k, "web", filters)
+
+
 
