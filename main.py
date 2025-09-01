@@ -1600,7 +1600,7 @@ def enhanced_search_modality(query: str, top_k: int, modality: str):
             results['documents'][0], 
             results['distances'][0]
         )):
-            if metadata and document:
+            if metadata:  # Changed to handle images without text content
                 # Convert distance to similarity score
                 score = 1.0 - (distance / 2.0)  # Normalize distance to 0-1 score
                 
@@ -1658,13 +1658,27 @@ def enhanced_search_modality(query: str, top_k: int, modality: str):
                         adjusted_score *= 1.5  # Increased from 1.2 to 1.5
                         logger.info(f"Content match found: {query} in chunk")
                 
+                # Handle different content types for different modalities
+                if modality == "image":
+                    # For images, use description or title as content
+                    content = metadata.get("description", "") or metadata.get("title", "") or "Image content"
+                elif modality == "audio":
+                    # For audio, use description or title as content
+                    content = metadata.get("description", "") or metadata.get("title", "") or "Audio content"
+                elif modality == "video":
+                    # For video, use description or title as content
+                    content = metadata.get("description", "") or metadata.get("title", "") or "Video content"
+                else:
+                    # For web content, use the document
+                    content = document or metadata.get("chunk", "")
+                
                 raw_results.append({
                     "score": adjusted_score,
                     "original_score": score,
                     "content_quality": metadata.get("content_quality", "normal"),
                     "content_type": metadata.get("content_type", ""),
                     **metadata,
-                    "chunk": document
+                    "chunk": content
                 })
         
         # Sort by adjusted score for better grouping
