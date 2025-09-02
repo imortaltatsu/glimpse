@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 """
-Batch script to add NSFW flags to existing indexed data
+Minimal, fast NSFW flagging using the hosted search endpoints.
+
+- Queries the main service (per modality, per tag)
+- Maps results back to Chroma items by url/txid/title
+- Writes 'is_nsfw', 'nsfw_keywords', and confidence
 """
 
 import chromadb
 from chromadb.config import Settings
-import torch
-import numpy as np
-from imagebind import data
-from imagebind.models import imagebind_model
-from imagebind.models.imagebind_model import ModalityType
-import time
+import os
+import requests
 import logging
 
 # Set up logging
@@ -18,241 +18,88 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Configuration
-DEVICE = "cuda:1" if torch.cuda.is_available() and torch.cuda.device_count() > 1 else "cuda" if torch.cuda.is_available() else "cpu"
-BATCH_SIZE = 100  # Process in batches to avoid memory issues
-NSFW_THRESHOLD = 0.6  # Threshold for NSFW classification
-USE_QUERY_MODE = True  # Use embedding-query mode for faster flagging
+BATCH_SIZE = int(os.getenv("NSFW_UPDATE_BATCH", "100"))
+NSFW_THRESHOLD = float(os.getenv("NSFW_THRESHOLD", "0.24"))
+USE_REMOTE_SEARCH = True
 
-# NSFW and Safe labels for zero-shot classification
-NSFW_LABELS = [
-    "nude person", "sexual content", "explicit content", "adult content",
-    "inappropriate content", "nsfw content", "pornographic content",
-    "violence", "graphic content", "disturbing content"
-]
+# Remote search configuration
+REMOTE_BASE_URL = os.getenv("REMOTE_SEARCH_BASE_URL", "https://arfetch.adityaberry.me")
+REMOTE_TIMEOUT = float(os.getenv("REMOTE_SEARCH_TIMEOUT", "20"))
 
-# Fast query mode tags (short, high-signal)
-NSFW_QUERY_TAGS = [
+DEFAULT_TAGS = [
     "nsfw", "porn", "xxx", "adult", "explicit", "sexual", "nude", "naked",
-    "erotic", "fetish", "bdsm", "hentai", "boobs", "tits", "dick", "pussy",
-    "blowjob", "anal", "cumshot", "pornstar", "lewd", "lingerie"
+    "erotic", "fetish", "bdsm", "hentai", "boobs", "breasts", "nipples",
+    "cumshot", "blowjob", "anal", "pussy", "vagina", "dick", "penis",
+    "lingerie", "pornstar", "lewd"
 ]
+TAGS = [t.strip() for t in os.getenv("NSFW_TAGS", ",".join(DEFAULT_TAGS)).split(",") if t.strip()]
 
-SAFE_LABELS = [
-    "safe content", "appropriate content", "family friendly content",
-    "clean content", "professional content", "educational content",
-    "artistic content", "nature content", "technology content"
-]
+# No local model needed in remote-search mode
 
-def load_imagebind_model():
-    """Load ImageBind model for NSFW detection"""
-    print(f"🔄 Loading ImageBind model on {DEVICE}...")
-    
-    # Show GPU information
-    if torch.cuda.is_available():
-        print(f"🔍 CUDA available: {torch.cuda.is_available()}")
-        print(f"🔍 Device count: {torch.cuda.device_count()}")
-        print(f"🔍 Current device: {torch.cuda.current_device()}")
-        if "cuda" in DEVICE:
-            device_id = int(DEVICE.split(":")[1]) if ":" in DEVICE else 0
-            print(f"🔍 Using GPU {device_id}: {torch.cuda.get_device_name(device_id)}")
-            print(f"🔍 GPU {device_id} memory: {torch.cuda.get_device_properties(device_id).total_memory / 1024**3:.1f} GB")
-    
-    model = imagebind_model.imagebind_huge(pretrained=True)
-    model.eval().to(DEVICE)
-    print("✅ ImageBind model loaded successfully")
-    return model
+# Local embedding helpers removed
 
-def _embed_text_tokens(model, text: str):
-    """Return a 1D numpy embedding for a given text using ImageBind tokens average."""
-    text_inputs = data.load_and_transform_text([text], DEVICE)
-    with torch.no_grad():
-        text_embedding = model.modality_preprocessors[ModalityType.TEXT](text_inputs)
-    if isinstance(text_embedding, dict) and 'trunk' in text_embedding and 'tokens' in text_embedding['trunk']:
-        emb = text_embedding['trunk']['tokens']
-        if len(emb.shape) == 3 and emb.shape[0] == 1:
-            emb = emb.squeeze(0).mean(dim=0)
-        if hasattr(emb, 'cpu'):
-            return emb.cpu().numpy().flatten()
-        return np.array(emb).flatten()
-    if hasattr(text_embedding, 'cpu'):
-        return text_embedding.cpu().numpy().flatten()
-    return np.array(text_embedding).flatten()
+# Local zero-shot path removed for minimalism and speed
 
-def detect_nsfw_zero_shot(model, content_embedding):
-    """
-    Detect NSFW content using zero-shot classification
-    """
-    try:
-        # Debug: log the type and shape of the embedding (only for first few entries)
-        if hasattr(detect_nsfw_zero_shot, '_debug_count'):
-            detect_nsfw_zero_shot._debug_count += 1
-        else:
-            detect_nsfw_zero_shot._debug_count = 1
-            
-        if detect_nsfw_zero_shot._debug_count <= 1:
-            logger.info(f"Content embedding type: {type(content_embedding)}, length: {len(content_embedding) if isinstance(content_embedding, (list, tuple)) else 'N/A'}")
-        # Create text embeddings for NSFW and safe labels
-        nsfw_embeddings = []
-        safe_embeddings = []
-        
-        for i, text in enumerate(NSFW_LABELS):
-            text_inputs = data.load_and_transform_text([text], DEVICE)
-            with torch.no_grad():
-                text_embedding = model.modality_preprocessors[ModalityType.TEXT](text_inputs)
-                
-                # Debug logging for first text embedding only
-                if i < 1:
-                    logger.info(f"Text embedding type: {type(text_embedding)}")
-                    if isinstance(text_embedding, dict):
-                        logger.info(f"Text embedding keys: {list(text_embedding.keys())}")
-                        if 'trunk' in text_embedding and 'tokens' in text_embedding['trunk']:
-                            logger.info(f"  trunk.tokens shape: {text_embedding['trunk']['tokens'].shape}")
-                
-                # Handle different return types from ImageBind
-                if hasattr(text_embedding, 'cpu'):
-                    nsfw_embeddings.append(text_embedding.cpu().numpy())
-                elif isinstance(text_embedding, dict):
-                    # ImageBind returns nested dict structure: {'trunk': {...}, 'head': {...}}
-                    # The actual embedding is in trunk.tokens with shape [1, 77, 1024]
-                    emb = None
-                    
-                    if 'trunk' in text_embedding and 'tokens' in text_embedding['trunk']:
-                        emb = text_embedding['trunk']['tokens']
-                    else:
-                        # Fallback: try to find the largest tensor
-                        for key, value in text_embedding.items():
-                            if isinstance(value, dict):
-                                for subkey, subvalue in value.items():
-                                    if hasattr(subvalue, 'shape') and hasattr(subvalue, 'numel') and subvalue.numel() > 100:
-                                        emb = subvalue
-                                        break
-                            elif hasattr(value, 'shape') and hasattr(value, 'numel') and value.numel() > 100:
-                                emb = value
-                                break
-                    
-                    if emb is not None:
-                        if hasattr(emb, 'cpu'):
-                            # For tokens with shape [1, 77, 1024], we need to reshape to [1024] for comparison
-                            if len(emb.shape) == 3 and emb.shape[0] == 1:
-                                emb = emb.squeeze(0).mean(dim=0)  # Average over sequence length
-                            nsfw_embeddings.append(emb.cpu().numpy())
-                        else:
-                            nsfw_embeddings.append(np.array(emb))
-                    else:
-                        logger.error(f"Could not extract embedding from nested dict structure")
-                        continue
-                else:
-                    nsfw_embeddings.append(np.array(text_embedding))
-        
-        for text in SAFE_LABELS:
-            text_inputs = data.load_and_transform_text([text], DEVICE)
-            with torch.no_grad():
-                text_embedding = model.modality_preprocessors[ModalityType.TEXT](text_inputs)
-                
-                # Handle different return types from ImageBind
-                if hasattr(text_embedding, 'cpu'):
-                    safe_embeddings.append(text_embedding.cpu().numpy())
-                elif isinstance(text_embedding, dict):
-                    # ImageBind returns nested dict structure: {'trunk': {...}, 'head': {...}}
-                    # The actual embedding is in trunk.tokens with shape [1, 77, 1024]
-                    emb = None
-                    
-                    if 'trunk' in text_embedding and 'tokens' in text_embedding['trunk']:
-                        emb = text_embedding['trunk']['tokens']
-                    else:
-                        # Fallback: try to find the largest tensor
-                        for key, value in text_embedding.items():
-                            if isinstance(value, dict):
-                                for subkey, subvalue in value.items():
-                                    if hasattr(subvalue, 'shape') and hasattr(subvalue, 'numel') and subvalue.numel() > 100:
-                                        emb = subvalue
-                                        break
-                            elif hasattr(value, 'shape') and hasattr(value, 'numel') and value.numel() > 100:
-                                emb = value
-                                break
-                    
-                    if emb is not None:
-                        if hasattr(emb, 'cpu'):
-                            # For tokens with shape [1, 77, 1024], we need to reshape to [1024] for comparison
-                            if len(emb.shape) == 3 and emb.shape[0] == 1:
-                                emb = emb.squeeze(0).mean(dim=0)  # Average over sequence length
-                            safe_embeddings.append(emb.cpu().numpy())
-                        else:
-                            safe_embeddings.append(np.array(emb))
-                    else:
-                        logger.error(f"Could not extract embedding from nested dict structure")
-                        continue
-                else:
-                    safe_embeddings.append(np.array(text_embedding))
-        
-        # Calculate similarities - handle different embedding formats
-        if hasattr(content_embedding, 'cpu'):
-            # PyTorch tensor
-            content_embedding_np = content_embedding.cpu().numpy()
-        elif isinstance(content_embedding, (list, tuple)):
-            # List or tuple from ChromaDB
-            content_embedding_np = np.array(content_embedding)
-        elif isinstance(content_embedding, dict):
-            # Dictionary - extract the embedding values
-            if 'embedding' in content_embedding:
-                content_embedding_np = np.array(content_embedding['embedding'])
-            else:
-                # Try to convert dict values to array
-                content_embedding_np = np.array(list(content_embedding.values()))
-        else:
-            # Assume it's already a numpy array
-            content_embedding_np = np.array(content_embedding)
-        
-        # Ensure it's a 1D array
-        content_embedding_np = content_embedding_np.flatten()
-        
-        # Calculate cosine similarity with NSFW labels
-        nsfw_similarities = []
-        for nsfw_emb in nsfw_embeddings:
-            similarity = np.dot(content_embedding_np.flatten(), nsfw_emb.flatten()) / (
-                np.linalg.norm(content_embedding_np) * np.linalg.norm(nsfw_emb)
-            )
-            nsfw_similarities.append(similarity)
-        
-        # Calculate cosine similarity with safe labels
-        safe_similarities = []
-        for safe_emb in safe_embeddings:
-            similarity = np.dot(content_embedding_np.flatten(), safe_emb.flatten()) / (
-                np.linalg.norm(content_embedding_np) * np.linalg.norm(safe_emb)
-            )
-            safe_similarities.append(similarity)
-        
-        # Calculate NSFW score
-        max_nsfw_similarity = max(nsfw_similarities) if nsfw_similarities else 0
-        max_safe_similarity = max(safe_similarities) if safe_similarities else 0
-        
-        # NSFW score is the difference between max NSFW similarity and max safe similarity
-        nsfw_score = max_nsfw_similarity - max_safe_similarity
-        
-        # Normalize to 0-1 range
-        nsfw_score = (nsfw_score + 1) / 2  # Convert from [-1,1] to [0,1]
-        
-        # Determine if content is NSFW
-        is_nsfw = nsfw_score > NSFW_THRESHOLD
-        
-        return {
-            "is_nsfw": is_nsfw,
-            "nsfw_score": float(nsfw_score),
-            "max_nsfw_similarity": float(max_nsfw_similarity),
-            "max_safe_similarity": float(max_safe_similarity),
-            "confidence": float(abs(max_nsfw_similarity - max_safe_similarity))
-        }
-        
-    except Exception as e:
-        logger.error(f"NSFW detection failed: {e}")
-        return {
-            "is_nsfw": False,
-            "nsfw_score": 0.0,
-            "max_nsfw_similarity": 0.0,
-            "max_safe_similarity": 0.0,
-            "confidence": 0.0,
-            "error": str(e)
-        }
+def _collection_to_modality(collection_name: str) -> str:
+    name = collection_name.lower()
+    if "image" in name:
+        return "image"
+    if "video" in name:
+        return "video"
+    if "audio" in name:
+        return "audio"
+    if "web" in name or "all" in name:
+        return "web"
+    return "web"
+
+def _remote_search(modality: str, query: str, n_results: int) -> list:
+    endpoint_map = {
+        "image": "/searchimage",
+        "video": "/searchvideo",
+        "audio": "/searchaudio",
+        "web": "/searchweb",
+    }
+    path = endpoint_map.get(modality, "/searchweb")
+    url = f"{REMOTE_BASE_URL}{path}"
+    params = {
+        "q": query,
+        "n_results": n_results,
+        "filter_nsfw": "false",
+    }
+    resp = requests.get(url, params=params, timeout=REMOTE_TIMEOUT)
+    resp.raise_for_status()
+    data_json = resp.json() or {}
+    return data_json.get("results", [])
+
+def _find_ids_by_urls(collection, urls: list) -> list:
+    found_ids = []
+    for u in urls:
+        try:
+            # Try match by exact url in metadata
+            got = collection.get(where={"url": u}) or {}
+            ids = got.get("ids") or []
+            if ids:
+                found_ids.extend(ids)
+                continue
+            # Fallback: sometimes txid equals url
+            got2 = collection.get(where={"txid": u}) or {}
+            ids2 = got2.get("ids") or []
+            if ids2:
+                found_ids.extend(ids2)
+                continue
+            # Fallback by title/description exact
+            got3 = collection.get(where={"title": u}) or {}
+            ids3 = got3.get("ids") or []
+            if ids3:
+                found_ids.extend(ids3)
+                continue
+            got4 = collection.get(where={"description": u}) or {}
+            ids4 = got4.get("ids") or []
+            if ids4:
+                found_ids.extend(ids4)
+        except Exception as e:
+            logger.error(f"Lookup by url failed for {u}: {e}")
+    return found_ids
 
 def process_collection(collection, model, collection_name):
     """Process a single collection to add NSFW flags"""
@@ -266,145 +113,72 @@ def process_collection(collection, model, collection_name):
         print("⚠️ Collection is empty, skipping...")
         return
     
-    # Fast query path: query per tag and flag results
-    if USE_QUERY_MODE:
-        print("⚡ Using query-based NSFW tagging")
-        # Pre-embed all tags
-        tag_to_embedding = {}
-        for tag in NSFW_QUERY_TAGS:
-            try:
-                tag_to_embedding[tag] = _embed_text_tokens(model, tag)
-            except Exception as e:
-                logger.error(f"Failed to embed tag '{tag}': {e}")
-        # Accumulate flags
+    # Remote main-service search (only path)
+    if USE_REMOTE_SEARCH:
+        modality = _collection_to_modality(collection_name)
+        print(f"⚡ Using remote search on '{modality}' for NSFW tagging")
         id_to_tags = {}
-        # Heuristic: query top K proportional to collection size
-        top_k = max(200, min(2000, int(total_count * 0.02)))
-        for tag, emb in tag_to_embedding.items():
+        # wider result pool to catch borderline
+        top_k = max(1000, min(10000, int(total_count * 0.10)))
+        for tag in TAGS:
             try:
-                q = collection.query(query_embeddings=[emb.tolist()], n_results=top_k, include=["distances", "metadatas", "ids"])
-                ids = (q.get('ids') or [[]])[0]
-                distances = (q.get('distances') or [[]])[0]
-                # Convert Chroma distance to similarity if needed; assume cosine distance d in [0,2] -> sim = 1 - d/2
-                # If distances look > 1, still clamp.
-                sims = [max(0.0, min(1.0, 1.0 - (d / 2.0))) for d in distances]
-                for _id, sim in zip(ids, sims):
-                    if sim >= NSFW_THRESHOLD:
-                        id_to_tags.setdefault(_id, set()).add(tag)
+                results = _remote_search(modality, tag, top_k)
             except Exception as e:
-                logger.error(f"Query failed for tag '{tag}': {e}")
-        # Write back metadata
+                logger.error(f"Remote search failed for tag '{tag}': {e}")
+                continue
+            # collect urls above threshold
+            urls = []
+            for r in results:
+                try:
+                    score = float(r.get("score", 0.0))
+                    url_val = r.get("url") or r.get("txid") or r.get("title")
+                    if not url_val:
+                        continue
+                    if score >= NSFW_THRESHOLD:
+                        urls.append(url_val)
+                except Exception:
+                    continue
+            if not urls:
+                continue
+            ids = _find_ids_by_urls(collection, urls)
+            for _id in ids:
+                id_to_tags.setdefault(_id, set()).add(tag)
         if not id_to_tags:
-            print("ℹ️  No NSFW matches found via query mode for this collection")
+            print("ℹ️  No NSFW matches found via remote search for this collection")
             return
         updated_ids = []
         updated_metadatas = []
-        # Fetch metadatas in chunks to merge updates
         ids_list = list(id_to_tags.keys())
-        print(f"📝 Updating {len(ids_list)} items flagged by query mode")
+        print(f"📝 Updating {len(ids_list)} items flagged by remote search")
         for i in range(0, len(ids_list), BATCH_SIZE):
             batch_ids = ids_list[i:i+BATCH_SIZE]
             batch = collection.get(ids=batch_ids, include=["metadatas"]) or {}
             metas = (batch.get('metadatas') or [])
-            # Chroma returns list per id order
+            batch_updated_ids = []
+            batch_updated_metas = []
             for j, _id in enumerate(batch_ids):
                 md = metas[j] if j < len(metas) and metas[j] else {}
                 tags = sorted(list(id_to_tags[_id]))
                 md.update({
                     'is_nsfw': True,
-                    'nsfw_score': 1.0,  # mark confidently by query rule
+                    'nsfw_score': 1.0,
                     'nsfw_confidence': 1.0,
                     'nsfw_keywords': ','.join(tags)
                 })
-                updated_ids.append(_id)
-                updated_metadatas.append(md)
-            if updated_ids:
-                collection.update(ids=updated_ids, metadatas=updated_metadatas)
-                print(f"✅ Updated {len(updated_ids)} items via query mode")
+                batch_updated_ids.append(_id)
+                batch_updated_metas.append(md)
+            if batch_updated_ids:
+                collection.update(ids=batch_updated_ids, metadatas=batch_updated_metas)
+                print(f"✅ Updated {len(batch_updated_ids)} items via remote search")
         return
-
-    # Fallback: per-item zero-shot path
-    processed = 0
-    nsfw_count = 0
-    
-    for offset in range(0, total_count, BATCH_SIZE):
-        try:
-            # Get batch of entries
-            results = collection.get(
-                limit=BATCH_SIZE,
-                offset=offset,
-                include=["embeddings", "metadatas"]
-            )
-            
-            if not results['ids']:
-                break
-            
-            # Prepare updates
-            updated_metadatas = []
-            updated_ids = []
-            
-            for i, (entry_id, metadata, embedding) in enumerate(zip(
-                results['ids'], 
-                results['metadatas'], 
-                results['embeddings']
-            )):
-                # Skip if already has NSFW flag
-                if metadata and 'is_nsfw' in metadata:
-                    continue
-                
-                # Detect NSFW
-                nsfw_result = detect_nsfw_zero_shot(model, embedding)
-                
-                # Update metadata
-                updated_metadata = metadata.copy() if metadata else {}
-                updated_metadata['is_nsfw'] = nsfw_result['is_nsfw']
-                updated_metadata['nsfw_score'] = nsfw_result['nsfw_score']
-                updated_metadata['nsfw_confidence'] = nsfw_result['confidence']
-                
-                updated_metadatas.append(updated_metadata)
-                updated_ids.append(entry_id)
-                
-                if nsfw_result['is_nsfw']:
-                    nsfw_count += 1
-                
-                processed += 1
-            
-            # Update the collection with new metadata
-            if updated_ids:
-                collection.update(
-                    ids=updated_ids,
-                    metadatas=updated_metadatas
-                )
-                print(f"✅ Updated batch {offset//BATCH_SIZE + 1}: {len(updated_ids)} entries")
-            
-            # Progress update
-            if processed % 1000 == 0:
-                print(f"📈 Progress: {processed}/{total_count} ({processed/total_count*100:.1f}%)")
-                print(f"🚨 NSFW entries found so far: {nsfw_count}")
-            
-        except Exception as e:
-            logger.error(f"Error processing batch at offset {offset}: {e}")
-            continue
-    
-    print(f"✅ Collection {collection_name} complete!")
-    print(f"📊 Processed: {processed} entries")
-    print(f"🚨 NSFW entries: {nsfw_count} ({nsfw_count/processed*100:.1f}%)")
+    # No local fallback paths
 
 def main():
     """Main function to process all collections"""
-    print("🚀 Starting NSFW flag addition to existing indexed data")
-    print(f"🔧 Device: {DEVICE}")
-    print(f"📏 Batch size: {BATCH_SIZE}")
+    print("🚀 Starting NSFW flagging (remote search mode)")
+    print(f"📏 Update batch: {BATCH_SIZE}")
     print(f"🎯 NSFW threshold: {NSFW_THRESHOLD}")
-    
-    # Set CUDA device if using GPU
-    if "cuda" in DEVICE:
-        device_id = int(DEVICE.split(":")[1]) if ":" in DEVICE else 0
-        torch.cuda.set_device(device_id)
-        print(f"🎯 Set CUDA device to GPU {device_id}")
-    
-    # Load ImageBind model
-    model = load_imagebind_model()
+    print(f"🌐 Remote base: {REMOTE_BASE_URL}")
     
     # Initialize ChromaDB client
     print("\n🔄 Connecting to ChromaDB...")
@@ -427,10 +201,10 @@ def main():
             print(f"⏭️ Skipping empty collection: {collection_name}")
             continue
         
-        process_collection(collection, model, collection_name)
+        process_collection(collection, None, collection_name)
     
-    print("\n🎉 NSFW flag addition complete!")
-    print("💡 All entries now have 'is_nsfw' boolean flags in their metadata")
+    print("\n🎉 NSFW flagging complete!")
+    print("💡 Updated 'is_nsfw' flags written to metadata")
 
 if __name__ == "__main__":
     main()
