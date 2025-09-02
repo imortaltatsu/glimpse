@@ -21,12 +21,20 @@ logger = logging.getLogger(__name__)
 DEVICE = "cuda:1" if torch.cuda.is_available() and torch.cuda.device_count() > 1 else "cuda" if torch.cuda.is_available() else "cpu"
 BATCH_SIZE = 100  # Process in batches to avoid memory issues
 NSFW_THRESHOLD = 0.6  # Threshold for NSFW classification
+USE_QUERY_MODE = True  # Use embedding-query mode for faster flagging
 
 # NSFW and Safe labels for zero-shot classification
 NSFW_LABELS = [
     "nude person", "sexual content", "explicit content", "adult content",
     "inappropriate content", "nsfw content", "pornographic content",
     "violence", "graphic content", "disturbing content"
+]
+
+# Fast query mode tags (short, high-signal)
+NSFW_QUERY_TAGS = [
+    "nsfw", "porn", "xxx", "adult", "explicit", "sexual", "nude", "naked",
+    "erotic", "fetish", "bdsm", "hentai", "boobs", "tits", "dick", "pussy",
+    "blowjob", "anal", "cumshot", "pornstar", "lewd", "lingerie"
 ]
 
 SAFE_LABELS = [
@@ -53,6 +61,22 @@ def load_imagebind_model():
     model.eval().to(DEVICE)
     print("✅ ImageBind model loaded successfully")
     return model
+
+def _embed_text_tokens(model, text: str):
+    """Return a 1D numpy embedding for a given text using ImageBind tokens average."""
+    text_inputs = data.load_and_transform_text([text], DEVICE)
+    with torch.no_grad():
+        text_embedding = model.modality_preprocessors[ModalityType.TEXT](text_inputs)
+    if isinstance(text_embedding, dict) and 'trunk' in text_embedding and 'tokens' in text_embedding['trunk']:
+        emb = text_embedding['trunk']['tokens']
+        if len(emb.shape) == 3 and emb.shape[0] == 1:
+            emb = emb.squeeze(0).mean(dim=0)
+        if hasattr(emb, 'cpu'):
+            return emb.cpu().numpy().flatten()
+        return np.array(emb).flatten()
+    if hasattr(text_embedding, 'cpu'):
+        return text_embedding.cpu().numpy().flatten()
+    return np.array(text_embedding).flatten()
 
 def detect_nsfw_zero_shot(model, content_embedding):
     """
@@ -242,7 +266,64 @@ def process_collection(collection, model, collection_name):
         print("⚠️ Collection is empty, skipping...")
         return
     
-    # Process in batches
+    # Fast query path: query per tag and flag results
+    if USE_QUERY_MODE:
+        print("⚡ Using query-based NSFW tagging")
+        # Pre-embed all tags
+        tag_to_embedding = {}
+        for tag in NSFW_QUERY_TAGS:
+            try:
+                tag_to_embedding[tag] = _embed_text_tokens(model, tag)
+            except Exception as e:
+                logger.error(f"Failed to embed tag '{tag}': {e}")
+        # Accumulate flags
+        id_to_tags = {}
+        # Heuristic: query top K proportional to collection size
+        top_k = max(200, min(2000, int(total_count * 0.02)))
+        for tag, emb in tag_to_embedding.items():
+            try:
+                q = collection.query(query_embeddings=[emb.tolist()], n_results=top_k, include=["distances", "metadatas", "ids"])
+                ids = (q.get('ids') or [[]])[0]
+                distances = (q.get('distances') or [[]])[0]
+                # Convert Chroma distance to similarity if needed; assume cosine distance d in [0,2] -> sim = 1 - d/2
+                # If distances look > 1, still clamp.
+                sims = [max(0.0, min(1.0, 1.0 - (d / 2.0))) for d in distances]
+                for _id, sim in zip(ids, sims):
+                    if sim >= NSFW_THRESHOLD:
+                        id_to_tags.setdefault(_id, set()).add(tag)
+            except Exception as e:
+                logger.error(f"Query failed for tag '{tag}': {e}")
+        # Write back metadata
+        if not id_to_tags:
+            print("ℹ️  No NSFW matches found via query mode for this collection")
+            return
+        updated_ids = []
+        updated_metadatas = []
+        # Fetch metadatas in chunks to merge updates
+        ids_list = list(id_to_tags.keys())
+        print(f"📝 Updating {len(ids_list)} items flagged by query mode")
+        for i in range(0, len(ids_list), BATCH_SIZE):
+            batch_ids = ids_list[i:i+BATCH_SIZE]
+            batch = collection.get(ids=batch_ids, include=["metadatas"]) or {}
+            metas = (batch.get('metadatas') or [])
+            # Chroma returns list per id order
+            for j, _id in enumerate(batch_ids):
+                md = metas[j] if j < len(metas) and metas[j] else {}
+                tags = sorted(list(id_to_tags[_id]))
+                md.update({
+                    'is_nsfw': True,
+                    'nsfw_score': 1.0,  # mark confidently by query rule
+                    'nsfw_confidence': 1.0,
+                    'nsfw_keywords': ','.join(tags)
+                })
+                updated_ids.append(_id)
+                updated_metadatas.append(md)
+            if updated_ids:
+                collection.update(ids=updated_ids, metadatas=updated_metadatas)
+                print(f"✅ Updated {len(updated_ids)} items via query mode")
+        return
+
+    # Fallback: per-item zero-shot path
     processed = 0
     nsfw_count = 0
     
