@@ -144,6 +144,7 @@ dmypy.json
 
 # Vector database files
 chroma_db/
+index_data/
 *.db
 *.sqlite
 *.sqlite3

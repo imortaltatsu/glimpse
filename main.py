@@ -46,6 +46,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Suppress PostHog/telemetry warnings
+logging.getLogger("posthog").setLevel(logging.ERROR)
+logging.getLogger("chromadb.telemetry").setLevel(logging.ERROR)
+
 # Add file handler for logging to 'indexer.log'
 file_handler = logging.FileHandler('indexer.log')
 file_handler.setLevel(logging.INFO)
@@ -57,6 +61,12 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 DATA_DIR = "index_data"
 os.makedirs(DATA_DIR, exist_ok=True)
 MODALITIES = ["web", "image", "audio", "video", "all"]
+
+# CUDA optimization settings
+if torch.cuda.is_available():
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cudnn.deterministic = False
+    print("✅ CUDA optimizations enabled")
 
 # Check if ffmpeg is available for audio/video processing
 def check_ffmpeg():
@@ -76,12 +86,16 @@ else:
 CHROMA_PERSIST_DIR = os.path.join(DATA_DIR, "chroma_db")
 os.makedirs(CHROMA_PERSIST_DIR, exist_ok=True)
 
-# Initialize ChromaDB client
+# Initialize ChromaDB client with telemetry disabled
+os.environ["ANONYMIZED_TELEMETRY"] = "False"
+os.environ["CHROMA_TELEMETRY_ENABLED"] = "False"
+
 chroma_client = chromadb.PersistentClient(
     path=CHROMA_PERSIST_DIR,
     settings=Settings(
         anonymized_telemetry=False,
-        allow_reset=True
+        allow_reset=True,
+        is_persistent=True
     )
 )
 
@@ -111,21 +125,155 @@ BATCH_SIZE = 100
 TOP_K = 10
 POLL_INTERVAL = 60
 
-# ==== Load ImageBind with CPU Fallback ====
+# ==== Load ImageBind with Enhanced CUDA Support ====
 print("🔄 Loading ImageBind model...")
+print(f"🔍 PyTorch version: {torch.__version__}")
+print(f"🔍 CUDA available: {torch.cuda.is_available()}")
+if torch.cuda.is_available():
+    print(f"🔍 CUDA version: {torch.version.cuda}")
+    print(f"🔍 Device count: {torch.cuda.device_count()}")
+    print(f"🔍 Current device: {torch.cuda.current_device()}")
+    print(f"🔍 Device name: {torch.cuda.get_device_name(0)}")
+    print(f"🔍 Memory allocated: {torch.cuda.memory_allocated(0) / 1024**3:.2f} GB")
+    print(f"🔍 Memory cached: {torch.cuda.memory_reserved(0) / 1024**3:.2f} GB")
+
 try:
+    print(f"🚀 Attempting to load ImageBind on {DEVICE}...")
     model = imagebind_model.imagebind_huge(pretrained=True)
-    model.eval().to(DEVICE)
+    print("✅ Model loaded from pretrained weights")
+    
+    model.eval()
+    print("✅ Model set to evaluation mode")
+    
+    model = model.to(DEVICE)
+    print(f"✅ Model moved to {DEVICE}")
+    
+    # Test CUDA memory allocation
+    if DEVICE == "cuda":
+        test_input = torch.randn(1, 3, 224, 224).to(DEVICE)
+        with torch.no_grad():
+            _ = model.modality_preprocessors[ModalityType.VISION](test_input)
+        print("✅ CUDA forward pass test successful")
+        print(f"🔍 Final memory allocated: {torch.cuda.memory_allocated(0) / 1024**3:.2f} GB")
+    
     print(f"✅ ImageBind model loaded successfully on {DEVICE}")
+    
 except Exception as e:
-    print(f"⚠️  Failed to load ImageBind on {DEVICE}, falling back to CPU")
+    print(f"❌ Failed to load ImageBind on {DEVICE}")
+    print(f"❌ Error details: {str(e)}")
+    print(f"❌ Error type: {type(e).__name__}")
+    
+    if DEVICE == "cuda":
+        print("🔄 Attempting CUDA memory cleanup...")
+        try:
+            torch.cuda.empty_cache()
+            print("✅ CUDA cache cleared")
+        except Exception as cleanup_error:
+            print(f"⚠️ CUDA cleanup failed: {cleanup_error}")
+    
+    print("🔄 Falling back to CPU...")
     DEVICE = "cpu"
-    model = imagebind_model.imagebind_huge(pretrained=True)
-    model.eval().to(DEVICE)
-    print("✅ ImageBind model loaded successfully on CPU")
+    try:
+        model = imagebind_model.imagebind_huge(pretrained=True)
+        model.eval().to(DEVICE)
+        print("✅ ImageBind model loaded successfully on CPU")
+    except Exception as cpu_error:
+        print(f"❌ Failed to load on CPU as well: {cpu_error}")
+        raise RuntimeError(f"Failed to load ImageBind on both CUDA and CPU: {e} -> {cpu_error}")
 
 splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=100)
 print("✅ Text splitter initialized")
+
+# ==== NSFW Detection using Zero-Shot Classification ====
+NSFW_LABELS = [
+    "nude person", "sexual content", "explicit content", "adult content",
+    "inappropriate content", "nsfw content", "pornographic content",
+    "violence", "graphic content", "disturbing content"
+]
+
+SAFE_LABELS = [
+    "safe content", "appropriate content", "family friendly content",
+    "clean content", "professional content", "educational content",
+    "artistic content", "nature content", "technology content"
+]
+
+def detect_nsfw_zero_shot(content_embedding, modality="text"):
+    """
+    Detect NSFW content using zero-shot classification with existing embeddings
+    """
+    try:
+        # Get text embeddings for NSFW and safe labels
+        nsfw_texts = NSFW_LABELS
+        safe_texts = SAFE_LABELS
+        
+        # Create text embeddings for labels
+        nsfw_embeddings = []
+        safe_embeddings = []
+        
+        for text in nsfw_texts:
+            text_inputs = data.load_and_transform_text([text], DEVICE)
+            with torch.no_grad():
+                text_embedding = model.modality_preprocessors[ModalityType.TEXT](text_inputs)
+                nsfw_embeddings.append(text_embedding.cpu().numpy())
+        
+        for text in safe_texts:
+            text_inputs = data.load_and_transform_text([text], DEVICE)
+            with torch.no_grad():
+                text_embedding = model.modality_preprocessors[ModalityType.TEXT](text_inputs)
+                safe_embeddings.append(text_embedding.cpu().numpy())
+        
+        # Calculate similarities
+        content_embedding_np = content_embedding.cpu().numpy() if hasattr(content_embedding, 'cpu') else content_embedding
+        
+        # Calculate cosine similarity with NSFW labels
+        nsfw_similarities = []
+        for nsfw_emb in nsfw_embeddings:
+            similarity = np.dot(content_embedding_np.flatten(), nsfw_emb.flatten()) / (
+                np.linalg.norm(content_embedding_np) * np.linalg.norm(nsfw_emb)
+            )
+            nsfw_similarities.append(similarity)
+        
+        # Calculate cosine similarity with safe labels
+        safe_similarities = []
+        for safe_emb in safe_embeddings:
+            similarity = np.dot(content_embedding_np.flatten(), safe_emb.flatten()) / (
+                np.linalg.norm(content_embedding_np) * np.linalg.norm(safe_emb)
+            )
+            safe_similarities.append(similarity)
+        
+        # Calculate NSFW score
+        max_nsfw_similarity = max(nsfw_similarities) if nsfw_similarities else 0
+        max_safe_similarity = max(safe_similarities) if safe_similarities else 0
+        
+        # NSFW score is the difference between max NSFW similarity and max safe similarity
+        nsfw_score = max_nsfw_similarity - max_safe_similarity
+        
+        # Normalize to 0-1 range
+        nsfw_score = (nsfw_score + 1) / 2  # Convert from [-1,1] to [0,1]
+        
+        # Determine if content is NSFW (threshold can be adjusted)
+        is_nsfw = nsfw_score > 0.6
+        
+        return {
+            "is_nsfw": is_nsfw,
+            "nsfw_score": float(nsfw_score),
+            "max_nsfw_similarity": float(max_nsfw_similarity),
+            "max_safe_similarity": float(max_safe_similarity),
+            "confidence": float(abs(max_nsfw_similarity - max_safe_similarity))
+        }
+        
+    except Exception as e:
+        logger.error(f"NSFW detection failed: {e}")
+        return {
+            "is_nsfw": False,
+            "nsfw_score": 0.0,
+            "max_nsfw_similarity": 0.0,
+            "max_safe_similarity": 0.0,
+            "confidence": 0.0,
+            "error": str(e)
+        }
+
+print("✅ NSFW detection using zero-shot classification initialized")
 
 # ==== Index Handling ====
 def load_index(path):
@@ -329,7 +477,7 @@ def detect_file_type(url):
             content_type = resp.headers.get('content-type', '').lower()
             if 'application/pdf' in content_type:
                 return "pdf"
-            if 'text/html' in content_type or 'application/xhtml+xml' in content_type:
+            if 'text/html' in content_type or 'application/xhtml+xml' in content_type or 'text/plain' in content_type:
                 return "web"
             if 'image/' in content_type:
                 return "image"
@@ -362,7 +510,7 @@ def detect_file_type(url):
                     break
             resp = requests.head(test_url, timeout=10, allow_redirects=True)
             content_type = resp.headers.get('content-type', '').lower()
-            if 'text/html' in content_type or 'application/xhtml+xml' in content_type:
+            if 'text/html' in content_type or 'application/xhtml+xml' in content_type or 'text/plain' in content_type:
                 return "web"
             if 'image/' in content_type:
                 return "image"
@@ -402,7 +550,10 @@ def detect_file_type(url):
         return "video"
     # Web/HTML content (robust check: anywhere in first 64 bytes)
     if (b'<html' in magic.lower() or b'<!doctype' in magic.lower() or b'<HTML' in magic or b'<?xml' in magic or
-        magic.startswith(b'{') or magic.startswith(b'[')):
+        magic.startswith(b'{') or magic.startswith(b'[') or
+        b'found' in magic.lower() or b'redirect' in magic.lower() or b'error' in magic.lower() or
+        b'cdn77' in magic.lower() or b'302' in magic or b'404' in magic or b'not found' in magic.lower() or
+        b'temporarily moved' in magic.lower() or b'new location' in magic.lower() or b'page not found' in magic.lower()):
         return "web"
     return "binary"
 
@@ -423,6 +574,10 @@ def embed_image(url):
             content_type = headers.get('content-type', '').lower()
             if not content_type.startswith('image/'):
                 logger.warning(f"URL {url} has non-image content-type: {content_type}")
+                # Check if it's actually HTML/redirect content
+                if 'text/html' in content_type or 'text/plain' in content_type:
+                    logger.warning(f"URL {url} is HTML/text content, not image - skipping")
+                    return None
         except Exception as e:
             logger.warning(f"Could not check headers for {url}: {e}")
         
@@ -432,6 +587,16 @@ def embed_image(url):
         if len(img_bytes) < 100:  # Too small to be a valid image
             logger.warning(f"Image file too small for {url}: {len(img_bytes)} bytes")
             return None
+        
+        # Additional validation: check if content is actually HTML/redirect
+        if len(img_bytes) > 64:
+            magic = img_bytes[:64].lower()
+            if (b'<html' in magic or b'<!doctype' in magic or b'found' in magic or 
+                b'redirect' in magic or b'error' in magic or b'cdn77' in magic or
+                b'302' in magic or b'404' in magic or b'not found' in magic or
+                b'temporarily moved' in magic or b'new location' in magic):
+                logger.warning(f"URL {url} contains HTML/redirect content, not image - skipping")
+                return None
             
         temp_dir = os.path.join(DATA_DIR, "temp")
         os.makedirs(temp_dir, exist_ok=True)
@@ -499,6 +664,10 @@ def embed_audio(url):
             content_type = headers.get('content-type', '').lower()
             if not content_type.startswith('audio/'):
                 logger.warning(f"URL {url} has non-audio content-type: {content_type}")
+                # Check if it's actually HTML/redirect content
+                if 'text/html' in content_type or 'text/plain' in content_type:
+                    logger.warning(f"URL {url} is HTML/text content, not audio - skipping")
+                    return None
         except Exception as e:
             logger.warning(f"Could not check headers for {url}: {e}")
         
@@ -508,6 +677,16 @@ def embed_audio(url):
         if len(audio_bytes) < 100:  # Too small to be a valid audio file
             logger.warning(f"Audio file too small for {url}: {len(audio_bytes)} bytes")
             return None
+        
+        # Additional validation: check if content is actually HTML/redirect
+        if len(audio_bytes) > 64:
+            magic = audio_bytes[:64].lower()
+            if (b'<html' in magic or b'<!doctype' in magic or b'found' in magic or 
+                b'redirect' in magic or b'error' in magic or b'cdn77' in magic or
+                b'302' in magic or b'404' in magic or b'not found' in magic or
+                b'temporarily moved' in magic or b'new location' in magic):
+                logger.warning(f"URL {url} contains HTML/redirect content, not audio - skipping")
+                return None
             
         temp_dir = os.path.join(DATA_DIR, "temp")
         os.makedirs(temp_dir, exist_ok=True)
@@ -611,6 +790,10 @@ def embed_video(url):
             content_type = headers.get('content-type', '').lower()
             if not content_type.startswith('video/'):
                 logger.warning(f"URL {url} has non-video content-type: {content_type}")
+                # Check if it's actually HTML/redirect content
+                if 'text/html' in content_type or 'text/plain' in content_type:
+                    logger.warning(f"URL {url} is HTML/text content, not video - skipping")
+                    return None
         except Exception as e:
             logger.warning(f"Could not check headers for {url}: {e}")
         
@@ -620,6 +803,16 @@ def embed_video(url):
         if len(video_bytes) < 1000:  # Too small to be a valid video file
             logger.warning(f"Video file too small for {url}: {len(video_bytes)} bytes")
             return None
+        
+        # Additional validation: check if content is actually HTML/redirect
+        if len(video_bytes) > 64:
+            magic = video_bytes[:64].lower()
+            if (b'<html' in magic or b'<!doctype' in magic or b'found' in magic or 
+                b'redirect' in magic or b'error' in magic or b'cdn77' in magic or
+                b'302' in magic or b'404' in magic or b'not found' in magic or
+                b'temporarily moved' in magic or b'new location' in magic):
+                logger.warning(f"URL {url} contains HTML/redirect content, not video - skipping")
+                return None
             
         temp_dir = os.path.join(DATA_DIR, "temp")
         os.makedirs(temp_dir, exist_ok=True)
@@ -1794,7 +1987,7 @@ def status():
 
 # Old search_modality function removed - using enhanced_search_modality instead
 
-def enhanced_search_modality(query: str, top_k: int, modality: str):
+def enhanced_search_modality(query: str, top_k: int, modality: str, filter_nsfw: bool = False):
     """
     Enhanced search with ChromaDB and improved weighting for better search results.
     """
@@ -1911,9 +2104,24 @@ def enhanced_search_modality(query: str, top_k: int, modality: str):
                     "original_score": score,
                     "content_quality": metadata.get("content_quality", "normal"),
                     "content_type": metadata.get("content_type", ""),
+                    "is_nsfw": metadata.get("is_nsfw", False),
+                    "nsfw_score": metadata.get("nsfw_score", 0.0),
+                    "nsfw_confidence": metadata.get("nsfw_confidence", 0.0),
                     **metadata,
                     "chunk": content
                 })
+        
+        # Apply NSFW filtering if requested
+        if filter_nsfw:
+            filtered_results = []
+            for result in raw_results:
+                is_nsfw = result.get('is_nsfw', False)
+                if not is_nsfw:
+                    filtered_results.append(result)
+                else:
+                    logger.info(f"Filtered NSFW content: {result.get('url', 'unknown')} (NSFW flag: {is_nsfw})")
+            raw_results = filtered_results
+            logger.info(f"NSFW filtering applied: {len(filtered_results)} results remaining out of {len(raw_results)}")
         
         # Sort by adjusted score for better grouping
         raw_results.sort(key=lambda x: -x['score'])
@@ -1962,6 +2170,22 @@ def store_in_chromadb(emb, meta, modality, collection_name=None):
     Store embedding and metadata in ChromaDB with simplified rich metadata.
     """
     try:
+        # Validate embedding before proceeding
+        if emb is None:
+            logger.error(f"Cannot store None embedding for {modality} - {meta.get('url', '')}")
+            return False
+        
+        # Ensure embedding is a numpy array or tensor
+        if hasattr(emb, 'tolist'):
+            embedding_list = emb.tolist()
+        elif hasattr(emb, 'numpy'):
+            embedding_list = emb.numpy().tolist()
+        elif hasattr(emb, 'cpu'):
+            embedding_list = emb.cpu().numpy().tolist()
+        else:
+            logger.error(f"Invalid embedding type for {modality}: {type(emb)}")
+            return False
+        
         # Determine which collection to use
         if collection_name == "arns":
             collection = arns_collection
@@ -2034,13 +2258,13 @@ def store_in_chromadb(emb, meta, modality, collection_name=None):
         
         # Store in ChromaDB
         collection.add(
-            embeddings=[emb.tolist()],
+            embeddings=[embedding_list],
             metadatas=[chroma_metadata],
             documents=[meta.get("chunk", "")],
             ids=[unique_id]
         )
         
-        logger.info(f"✅ Stored simplified metadata in ChromaDB: {modality} - {meta.get('url', '')}")
+        logger.info(f"✅ Stored embedding and metadata in ChromaDB: {modality} - {meta.get('url', '')} (dimensions: {len(embedding_list)})")
         return True
         
     except Exception as e:
@@ -2520,7 +2744,7 @@ def create_weighted_chunks_from_web_loader(web_loader_metadata, enhanced_metadat
 
 # Update ARNS search endpoint to use ARNS-exclusive index/meta
 @app.get("/searchweb")
-def search_web(query: str, top_k: int = TOP_K, arns_only: bool = False):
+def search_web(query: str, top_k: int = TOP_K, arns_only: bool = False, filter_nsfw: bool = False):
     if arns_only:
         # Search ARNS-exclusive collection
         try:
@@ -2588,19 +2812,19 @@ def search_web(query: str, top_k: int = TOP_K, arns_only: bool = False):
             logger.error(f"ARNS search failed: {e}")
             return {"results": []}
     else:
-        return enhanced_search_modality(query, top_k, "web")
+        return enhanced_search_modality(query, top_k, "web", filter_nsfw)
 
 @app.get("/searchimage")
-def search_image(query: str, top_k: int = TOP_K, arns_only: bool = False):
-    return enhanced_search_modality(query, top_k, "image")
+def search_image(query: str, top_k: int = TOP_K, arns_only: bool = False, filter_nsfw: bool = False):
+    return enhanced_search_modality(query, top_k, "image", filter_nsfw)
 
 @app.get("/searchaudio")
-def search_audio(query: str, top_k: int = TOP_K, arns_only: bool = False):
-    return enhanced_search_modality(query, top_k, "audio")
+def search_audio(query: str, top_k: int = TOP_K, arns_only: bool = False, filter_nsfw: bool = False):
+    return enhanced_search_modality(query, top_k, "audio", filter_nsfw)
 
 @app.get("/searchvideo")
-def search_video(query: str, top_k: int = TOP_K, arns_only: bool = False):
-    return enhanced_search_modality(query, top_k, "video")
+def search_video(query: str, top_k: int = TOP_K, arns_only: bool = False, filter_nsfw: bool = False):
+    return enhanced_search_modality(query, top_k, "video", filter_nsfw)
 
 API_URL = "https://cu.ardrive.io/dry-run?process-id=qNvAoz0TgcH7DMg8BCVn8jF32QH5L6T29VjHxhHqqGE"
 HEADERS = {
@@ -2738,333 +2962,6 @@ def index_modality_loop(modality, content_types):
             logger.error(f"[{modality.capitalize()} Indexer Error] {e}")
             time.sleep(30)
 
-
-
-# ==== Test Functions ====
-def test_webpage_indexing():
-    """
-    Test the enhanced webpage indexing functionality with arlink.arweave.net
-    """
-    test_url = "https://arlink.arweave.net"
-    
-    print(f"🧪 Testing enhanced webpage indexing with: {test_url}")
-    print("=" * 60)
-    
-    # Test 1: Check if it's a valid webpage
-    print("1. Testing webpage detection...")
-    is_webpage = check_webpage(test_url)
-    print(f"   ✅ Is webpage: {is_webpage}")
-    
-    if not is_webpage:
-        print("   ❌ Not a valid webpage, skipping further tests")
-        return
-    
-    # Test 2: Test content validation
-    print("\n2. Testing content validation...")
-    try:
-        resp = requests.get(test_url, timeout=10)
-        content = resp.text
-        is_valid = is_valid_content(content[:500])  # Test first 500 chars
-        print(f"   ✅ Content validation: {is_valid}")
-    except Exception as e:
-        print(f"   ❌ Content validation failed: {e}")
-        return
-    
-    # Test 3: Test enhanced webpage indexing with metadata
-    print("\n3. Testing enhanced webpage indexing with metadata...")
-    try:
-        results = enhanced_webpage_indexing_with_metadata(test_url, False)
-        print(f"   ✅ Extracted {len(results)} enhanced chunks")
-        
-        if results:
-            print("\n   📊 Enhanced Chunk Details:")
-            for i, (emb, meta) in enumerate(results):
-                print(f"   Chunk {i+1}:")
-                print(f"     - Type: {meta.get('content_type', 'unknown')}")
-                print(f"     - Weight: {meta.get('weight', 1.0)}")
-                print(f"     - Section: {meta.get('section', 'unknown')}")
-                print(f"     - Title: {meta.get('title', 'N/A')}")
-                print(f"     - Description: {meta.get('description', 'N/A')[:100]}...")
-                print(f"     - WebLoader Title: {meta.get('web_loader_title', 'N/A')}")
-                print(f"     - WebLoader Description: {meta.get('web_loader_description', 'N/A')[:100]}...")
-                print(f"     - Author: {meta.get('author', 'N/A')}")
-                print(f"     - Language: {meta.get('language', 'N/A')}")
-                print(f"     - Text Length: {meta.get('text_length', 0)}")
-                print(f"     - Word Count: {meta.get('word_count', 0)}")
-                print(f"     - Has Title: {meta.get('has_title', False)}")
-                print(f"     - Has Description: {meta.get('has_description', False)}")
-                print(f"     - Embedding shape: {emb.shape}")
-                print()
-        else:
-            print("   ❌ No chunks extracted")
-            
-    except Exception as e:
-        print(f"   ❌ Enhanced webpage indexing failed: {e}")
-        return
-    
-    # Test 4: Test enhanced search with metadata
-    print("\n4. Testing enhanced search with metadata...")
-    try:
-        # Test search with a relevant query
-        test_query = "arlink"
-        search_results = enhanced_search_modality(test_query, 5, "web")
-        print(f"   ✅ Search returned {len(search_results.get('results', []))} results")
-        
-        if search_results.get('results'):
-            print("\n   🔍 Top Search Results:")
-            for i, result in enumerate(search_results['results'][:3]):
-                print(f"   Result {i+1}:")
-                print(f"     - Score: {result.get('score', 0):.4f}")
-                print(f"     - Type: {result.get('content_type', 'unknown')}")
-                print(f"     - URL: {result.get('url', 'unknown')}")
-                print(f"     - Title: {result.get('title', 'N/A')}")
-                print(f"     - Description: {result.get('description', 'N/A')[:100]}...")
-                print(f"     - WebLoader Title: {result.get('web_loader_title', 'N/A')}")
-                print(f"     - WebLoader Description: {result.get('web_loader_description', 'N/A')[:100]}...")
-                print(f"     - Author: {result.get('author', 'N/A')}")
-                print(f"     - Language: {result.get('language', 'N/A')}")
-                print()
-        else:
-            print("   ❌ No search results found")
-            
-    except Exception as e:
-        print(f"   ❌ Enhanced search failed: {e}")
-        return
-    
-    print("=" * 60)
-    print("✅ All tests completed successfully!")
-    print("🎉 Enhanced webpage indexing with metadata is working correctly!")
-
-def test_content_extraction():
-    """
-    Test content extraction specifically for arlink.arweave.net
-    """
-    test_url = "https://arlink.arweave.net"
-    
-    print(f"🔍 Testing content extraction for: {test_url}")
-    print("=" * 50)
-    
-    try:
-        # Test direct fetch
-        print("1. Testing direct fetch...")
-        resp = requests.get(test_url, timeout=10, headers={
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-        })
-        html_content = resp.text
-        print(f"   ✅ Fetched {len(html_content)} characters")
-        
-        # Test BeautifulSoup parsing
-        print("\n2. Testing HTML parsing...")
-        soup = BeautifulSoup(html_content, "html.parser")
-        title = soup.title.string if soup.title else "No title found"
-        print(f"   ✅ Title: {title}")
-        
-        # Test enhanced metadata extraction
-        print("\n3. Testing enhanced metadata extraction...")
-        enhanced_metadata = extract_enhanced_metadata(soup, test_url)
-        print(f"   ✅ Enhanced metadata extracted:")
-        for key, value in enhanced_metadata.items():
-            if value:
-                print(f"     - {key}: {str(value)[:100]}...")
-        
-        # Test content extraction with metadata
-        print("\n4. Testing content extraction with metadata...")
-        chunks, extracted_title, meta_desc = extract_and_weight_content(soup, test_url)
-        print(f"   ✅ Extracted {len(chunks)} chunks")
-        print(f"   ✅ Title: {extracted_title}")
-        print(f"   ✅ Meta description: {meta_desc[:100]}...")
-        
-        # Show chunk details with metadata
-        print("\n5. Enhanced Chunk Analysis:")
-        for i, chunk in enumerate(chunks):
-            print(f"   Chunk {i+1}:")
-            print(f"     - Type: {chunk['type']}")
-            print(f"     - Weight: {chunk['weight']}")
-            print(f"     - Section: {chunk['section']}")
-            print(f"     - Text length: {len(chunk['text'])}")
-            print(f"     - Preview: {chunk['text'][:80]}...")
-            print()
-        
-        # Test embedding creation with metadata
-        print("6. Testing embedding creation with metadata...")
-        weighted_results = create_weighted_embeddings(chunks, test_url, False)
-        print(f"   ✅ Created {len(weighted_results)} embeddings")
-        
-        for i, (emb, meta) in enumerate(weighted_results):
-            print(f"   Embedding {i+1}:")
-            print(f"     - Shape: {emb.shape}")
-            print(f"     - Type: {meta.get('content_type')}")
-            print(f"     - Weight: {meta.get('weight')}")
-            print(f"     - Title: {meta.get('title', 'N/A')}")
-            print(f"     - WebLoader Title: {meta.get('web_loader_title', 'N/A')}")
-            print(f"     - Author: {meta.get('author', 'N/A')}")
-            print(f"     - Language: {meta.get('language', 'N/A')}")
-            print()
-        
-    except Exception as e:
-        print(f"   ❌ Content extraction test failed: {e}")
-        import traceback
-        traceback.print_exc()
-
-def test_metadata_search():
-    """
-    Test metadata-based search functionality
-    """
-    test_url = "https://arlink.arweave.net"
-    
-    print(f"🔍 Testing metadata search for: {test_url}")
-    print("=" * 50)
-    
-    try:
-        # First, index the content
-        print("1. Indexing content for testing...")
-        results = enhanced_webpage_indexing_with_metadata(test_url, False)
-        if results:
-            for emb, meta in results:
-                store(emb, meta, "web")
-            print(f"   ✅ Indexed {len(results)} chunks")
-        
-        # Test metadata search
-        print("\n2. Testing metadata search...")
-        test_queries = [
-            "arlink",
-            "arweave",
-            "decentralized"
-        ]
-        
-        for query in test_queries:
-            print(f"\n   🔍 Testing query: '{query}'")
-            search_results = search_with_metadata_filters(query, 3, "web")
-            
-            if search_results.get('results'):
-                print(f"     ✅ Found {len(search_results['results'])} results")
-                for i, result in enumerate(search_results['results'][:2]):
-                    print(f"     Result {i+1}:")
-                    print(f"       - Score: {result.get('score', 0):.4f}")
-                    print(f"       - URL: {result.get('url', 'N/A')}")
-                    print(f"       - Title: {result.get('title', 'N/A')}")
-                    print(f"       - Type: {result.get('content_type', 'N/A')}")
-                    print(f"       - Author: {result.get('author', 'N/A')}")
-                    print(f"       - Language: {result.get('language', 'N/A')}")
-            else:
-                print(f"     ❌ No results for '{query}'")
-        
-    except Exception as e:
-        print(f"   ❌ Metadata search test failed: {e}")
-        import traceback
-        traceback.print_exc()
-
-def test_webloader_refactoring():
-    """
-    Test the WebBaseLoader refactoring functionality
-    """
-    test_urls = [
-        "https://arlink.arweave.net",  # Should work with WebBaseLoader
-        "https://test-non-assigned.arweave.net"  # Mock for testing
-    ]
-    
-    print("🧪 Testing WebBaseLoader Refactoring")
-    print("=" * 50)
-    
-    for test_url in test_urls:
-        print(f"\n🔍 Testing URL: {test_url}")
-        
-        try:
-            # Test webpage detection
-            is_webpage = check_webpage(test_url)
-            print(f"   ✅ Is webpage: {is_webpage}")
-            
-            if not is_webpage:
-                print("   ⚠️  Not a valid webpage, skipping")
-                continue
-            
-            # Test content extraction with WebBaseLoader
-            results = enhanced_webpage_indexing_with_metadata(test_url, True)  # is_arns=True
-            
-            if results:
-                print(f"   ✅ Extracted {len(results)} chunks")
-                
-                # Analyze processing method and metadata
-                web_loader_count = 0
-                beautifulsoup_count = 0
-                
-                for i, (emb, meta) in enumerate(results):
-                    processing_method = meta.get("processing_method", "unknown")
-                    web_loader_title = meta.get("web_loader_title", "")
-                    web_loader_description = meta.get("web_loader_description", "")
-                    web_loader_content = meta.get("web_loader_content", "")
-                    
-                    print(f"\n   Chunk {i+1}:")
-                    print(f"     - Processing Method: {processing_method}")
-                    print(f"     - WebBaseLoader Title: {web_loader_title[:50]}...")
-                    print(f"     - WebBaseLoader Description: {web_loader_description[:50]}...")
-                    print(f"     - WebBaseLoader Content Length: {len(web_loader_content)} chars")
-                    print(f"     - ARNS Status: {meta.get('arns_status', 'N/A')}")
-                    print(f"     - Is Non-Assigned: {meta.get('is_non_assigned_arns', False)}")
-                    
-                    if processing_method == "web_loader_primary":
-                        web_loader_count += 1
-                        print(f"     - ✅ WebBaseLoader Primary Method")
-                    else:
-                        beautifulsoup_count += 1
-                        print(f"     - 🔄 BeautifulSoup Fallback")
-                
-                print(f"\n   📊 Processing Summary:")
-                print(f"     - WebBaseLoader Primary: {web_loader_count}")
-                print(f"     - BeautifulSoup Fallback: {beautifulsoup_count}")
-                print(f"     - Total Chunks: {len(results)}")
-                
-                # Test search with processing method filtering
-                print(f"\n   🔍 Testing search with processing method...")
-                search_results = search_with_metadata_filters("arlink", 5, "web")
-                
-                if search_results.get('results'):
-                    print(f"     ✅ Found {len(search_results['results'])} search results")
-                    
-                    # Check processing methods in search results
-                    web_loader_results = 0
-                    for result in search_results['results']:
-                        if result.get('processing_method') == 'web_loader_primary':
-                            web_loader_results += 1
-                    
-                    print(f"     - WebBaseLoader processed results: {web_loader_results}")
-                    print(f"     - BeautifulSoup fallback results: {len(search_results['results']) - web_loader_results}")
-                else:
-                    print(f"     ⚠️  No search results found")
-                    
-            else:
-                print("   ❌ No chunks extracted")
-                
-        except Exception as e:
-            print(f"   ❌ WebBaseLoader refactoring test failed: {e}")
-            import traceback
-            traceback.print_exc()
-
-# Add test endpoints to FastAPI
-@app.get("/test/arlink")
-def test_arlink_endpoint():
-    """Test endpoint for arlink.arweave.net"""
-    test_webpage_indexing()
-    return {"message": "Arlink test completed, check logs for details"}
-
-@app.get("/test/arlink/extraction")
-def test_arlink_extraction_endpoint():
-    """Test content extraction for arlink.arweave.net"""
-    test_content_extraction()
-    return {"message": "Arlink extraction test completed, check logs for details"}
-
-@app.get("/test/metadata-search")
-def test_metadata_search_endpoint():
-    """Test metadata search functionality"""
-    test_metadata_search()
-    return {"message": "Metadata search test completed, check logs for details"}
-
-@app.get("/test/webloader-refactoring")
-def test_webloader_refactoring_endpoint():
-    """Test WebBaseLoader refactoring functionality"""
-    test_webloader_refactoring()
-    return {"message": "WebBaseLoader refactoring test completed, check logs for details"}
-
 def search_with_metadata_filters(query: str, top_k: int = TOP_K, modality: str = "web", 
                                 filters: dict = None, where: dict = None):
     """
@@ -3182,7 +3079,7 @@ def search_web_with_metadata(
     domain: str = None,
     has_title: bool = None,
     has_description: bool = None
-):
+    ):
     """Search web content with metadata filtering."""
     filters = {}
     if author:
