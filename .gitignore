@@ -151,8 +151,10 @@ index_data/
 
 # Log files
 logs/
+**/logs/**
 *.log
 *.log.*
+indexer.log
 
 # Temporary files
 temp/
